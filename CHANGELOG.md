@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0
+- Skin Retouch defaults to a separate editable non-destructive Retouch Layer.
+- Retouch layers persist target object ID, parameters and a compressed alpha mask.
+- Existing Retouch Layers can be reopened and edited.
+- Added Output mode: Retouch Layer or destructive Pixels.
+- Added Edit Active Retouch and script APIs for retouch layer discovery/editing.
+- Added build smoke-check before artifact upload and Pages deployment.
+
+# Changelog
+
 ## 0.3.0
 - Fix GitHub Pages bootstrap by enabling Pages from the deployment workflow.
 - Upgrade Script Library with search, Run Last Script and Run-before-save.
