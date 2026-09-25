@@ -1,22 +1,25 @@
-# KanPaint v0.2
+# KanPaint v0.3
 
-KanPaint là trình chỉnh ảnh web phát triển trên nền OpenShop 0.31.0, giữ bố cục quen thuộc kiểu Photoshop/Photopea và bổ sung workflow tập trung vào asset PNG, automation và retouch.
+KanPaint là trình chỉnh ảnh web phát triển trên nền OpenShop 0.31.0, giữ bố cục quen thuộc kiểu Photoshop/Photopea và tập trung vào Layer, automation/script và retouch.
 
-## Có trong v0.2
-- File > Export Layers...: xuất Visible / Selected / All layers, PNG trong suốt, Auto Trim theo alpha, padding và ZIP.
-- File > Scripts: Run Script và Script Library. Script chạy sandbox; thư viện script lưu local, có import / backup / restore.
-- Skin Retouch: brush có thể giới hạn bởi Selection; Amount tổng, Smooth, Light/Dark, Shadow Lift, Shine Reduce, Texture/Pores, Detail Preserve; preview khi thả slider, Apply full-resolution một lần.
+## V0.3
+- Sửa workflow GitHub Pages: cho phép workflow tự bật Pages khi repository chưa được cấu hình.
+- **File > Export Layers...**: Visible / Selected / All layers, PNG trong suốt, Auto Trim alpha, padding, ZIP.
+- **File > Scripts**: Run Script, Run Last Script, Script Library; thư viện có tìm kiếm, import/backup/restore và chạy thử ngay trong editor script.
+- Script API v0.3: document info, layer list/active/export/rename/visibility, selection info, Skin Retouch presets và toast.
+- **Skin Retouch v0.3**: Amount tổng, Smooth, Light/Dark, Shadow Lift, Shine Reduce, Even Skin Tone, Warm/Cool, Texture/Pores, Grain Size, Detail Preserve.
+- Preset: Natural, Soft Portrait, Shadow Fix, Texture Restore.
+- Có **Use Selection** để lấy vùng selection hiện tại làm retouch mask và **Clear Mask** để làm lại.
+- Slider đổi giá trị trực tiếp; preview render khi thả slider. Ảnh lớn dùng proxy preview, Apply mới render full-resolution.
 
 ## Kiến trúc
-KanPaint giữ phần mở rộng ở `src/kanpaint-v02.js` và `src/kanpaint-v02.css`, không tiếp tục phình `index.html` lớn của upstream. `tools/build-kanpaint.mjs` ghép extension vào OpenShop đã pin để tạo `dist/`.
+Phần KanPaint nằm ở `src/kanpaint-v03.js` và `src/kanpaint-v03.css`. Core OpenShop được pin trong workflow/build, tránh tiếp tục phình `index.html` upstream.
 
-## Build
-1. Đặt source OpenShop 0.31.0 vào `upstream/`.
-2. Chạy `npm run check`.
-3. Chạy `npm run build`.
-4. Serve `dist/` bằng HTTP server tĩnh.
-
-GitHub Pages workflow tự checkout upstream đã pin và build KanPaint.
+## Build local
+1. Đặt OpenShop 0.31.0 vào `upstream/`.
+2. `npm run check`
+3. `npm run build`
+4. Chạy `START_KANPAINT.bat` hoặc serve thư mục `dist/`.
 
 ## Giấy phép
-KanPaint v0.2 dựa trên OpenShop của SysAdminDoc / Matthew Parker. Giấy phép MIT gốc được giữ lại trong repo.
+KanPaint dựa trên OpenShop của SysAdminDoc / Matthew Parker. Giấy phép MIT gốc được giữ lại.
