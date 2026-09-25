@@ -1,4 +1,4 @@
-# KanPaint Script API v0.3
+# KanPaint Script API v0.4
 
 Script là JavaScript và hỗ trợ `await` ở top level.
 
@@ -22,6 +22,8 @@ await kan.selection.info();
 
 await kan.skin.info();
 await kan.skin.preset('natural'); // natural | soft | shadow | texture
+await kan.skin.layers();          // danh sách Retouch Layer
+await kan.skin.editActive();      // mở Retouch Layer đang chọn
 
 await kan.ui.toast('Message', 'info');
 ```
