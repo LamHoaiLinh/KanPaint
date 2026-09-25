@@ -1,23 +1,23 @@
-# KanPaint v0.4
+# KanPaint v0.5
 
 KanPaint là trình chỉnh ảnh web phát triển trên nền OpenShop 0.31.0, giữ bố cục quen thuộc kiểu Photoshop/Photopea và tập trung vào Layer, automation/script, asset export và retouch.
 
-## V0.4
-- **Skin Retouch non-destructive** là mặc định: bấm Apply sẽ tạo một layer riêng tên **Skin Retouch**, ảnh gốc không bị sửa.
-- Retouch layer lưu lại **mask + thông số**. Chọn lại layer đó rồi mở Skin Retouch để chỉnh tiếp.
-- Có lựa chọn Output: **Retouch Layer — non-destructive** hoặc **Pixels — destructive**.
-- Có **Edit Active Retouch**, Use Selection, Clear Mask và Hold: Before.
-- Retouch vẫn có Amount, Smooth, Light/Dark, Shadow Lift, Shine Reduce, Even Skin Tone, Warm/Cool, Texture/Pores, Grain Size, Detail Preserve và 4 preset.
-- **File > Export Layers...**: Visible / Selected / All, PNG transparent, Auto Trim alpha, padding và ZIP.
-- **File > Scripts**: Run Script, Run Last Script, Script Library; sandbox, tìm kiếm, import/backup/restore và chạy thử.
-- Script API v0.4 đọc được danh sách Retouch Layer và có thể mở Retouch Layer đang chọn.
-- CI có thêm smoke test sau khi build; GitHub Pages tự deploy khi Pages đã bật.
+## V0.5
+- **Skin Retouch non-destructive** tiếp tục là mặc định; ảnh gốc không bị sửa.
+- Retouch Layer lưu **mask thô + Feather + Density + toàn bộ thông số retouch**, nên mở lại vẫn chỉnh được.
+- **Show red mask overlay**: hiển thị vùng đang được retouch bằng lớp phủ đỏ kiểu Photoshop.
+- **Alt + Brush = Erase Mask**: giữ Alt khi quét để xóa mask.
+- **Invert Mask**.
+- **Feather 0–60 px** và **Density 0–100%**, preview cập nhật khi thả slider.
+- **Before / After Split View** với thanh kéo chia ảnh trước/sau.
+- Có Output: Retouch Layer — non-destructive / Pixels — destructive.
+- Có Edit Active Retouch, Use Selection, Clear Mask, Hold: Before.
+- File > Export Layers... và File > Scripts > Script Library... vẫn giữ đúng workflow kiểu Photopea.
+- Script API v0.5 thêm `kan.skin.maskInfo()` và `kan.skin.invertMask()`.
+- CI kiểm tra cú pháp, build, smoke test, artifact và GitHub Pages.
 
-## Hiệu năng và an toàn
-- Ảnh lớn dùng preview proxy khoảng <=1.2 MP; Apply mới render full-resolution.
-- Skin smoothing giữ chi tiết bằng Detail Preserve + Texture/Pores.
-- Script chạy trong iframe sandbox, không có quyền DOM/network/filesystem trực tiếp.
-- Phần KanPaint tiếp tục nằm ngoài core OpenShop trong `src/kanpaint-v04.js` và `src/kanpaint-v04.css`.
+## Hiệu năng
+Mask Feather dùng blur hai lượt theo trục ngang/dọc O(N), không Gaussian lặp nhiều lần. Red mask overlay tự giảm độ phân giải khi ảnh lớn. Preview Skin Retouch vẫn giới hạn khoảng 1.2 MP; Apply mới render full resolution.
 
 ## Build local
 1. Đặt OpenShop 0.31.0 vào `upstream/`.
