@@ -47,7 +47,7 @@ jobs:
       - name: Upload downloadable build
         uses: actions/upload-artifact@v4
         with:
-          name: KanPaint-v0.4
+          name: KanPaint-v0.5
           path: dist
           if-no-files-found: error
           retention-days: 30
