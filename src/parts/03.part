@@ -1,0 +1,90 @@
+                    }
+                };
+                window.addEventListener('message', onMessage);
+                const timeout = setTimeout(() => finish(false, new Error('Script timed out after 60 seconds')), 60000);
+                iframe.addEventListener('load', () => {
+                    iframe.contentWindow?.postMessage({
+                        type:'openshop:host-init', protocolVersion:1, pluginId:id, token,
+                        source:this._wrappedSource(raw), capabilities:[], api:{ version:1 },
+                        manifest:{ id, version:'1.0.0', name:safeName(name), minApiVersion:1 }
+                    }, '*');
+                }, { once:true });
+            });
+        },
+        runFile() {
+            const input = el('input', { type:'file', accept:'.js,.kan.js,text/javascript,application/javascript' });
+            input.addEventListener('change', async () => {
+                const file = input.files?.[0]; if (!file) return;
+                if (file.size > SCRIPT_BYTES) { OS.toast('Script is larger than 256 KiB', 'error'); return; }
+                try { await this.run(await file.text(), { name:file.name }); }
+                catch (error) { console.error(error); }
+            });
+            input.click();
+        },
+        exportLibrary() {
+            const payload = JSON.stringify({ format:'kanpaint-script-library', version:1, exportedAt:new Date().toISOString(), scripts:this._loadUser() }, null, 2);
+            OS._downloadBlob(new Blob([payload], { type:'application/json' }), 'KanPaint-Script-Library.kanlib.json');
+            OS.toast('Script Library backup exported', 'success');
+        },
+        importLibrary(onImported) {
+            const input = el('input', { type:'file', accept:'.json,.kanlib,.kanlib.json,application/json' });
+            input.addEventListener('change', async () => {
+                const file=input.files?.[0]; if(!file)return;
+                try {
+                    if(file.size > SCRIPT_TOTAL_BYTES * 2) throw new Error('Library backup is too large');
+                    const parsed=JSON.parse(await file.text());
+                    const incoming=Array.isArray(parsed) ? parsed : parsed?.scripts;
+                    if(!Array.isArray(incoming)) throw new Error('Not a KanPaint Script Library backup');
+                    const current=this._loadUser();
+                    const merged=[...current];
+                    for(const item of incoming){
+                        if(!item || typeof item.source!=='string')continue;
+                        if(textBytes(item.source)>SCRIPT_BYTES)continue;
+                        const clean={ id:`user.${Date.now()}.${Math.random().toString(36).slice(2)}`, name:safeName(item.name,'Imported Script'), description:String(item.description||'Imported from library backup').slice(0,240), source:item.source };
+                        merged.push(clean);
+                        if(merged.length>=SCRIPT_LIMIT)break;
+                    }
+                    this._saveUser(merged); OS.toast('Script Library backup imported', 'success'); onImported?.();
+                } catch(error){ OS.toast(`Could not import Script Library: ${error.message}`, 'error'); }
+            });
+            input.click();
+        },
+        showLibrary() {
+            const ui = modal('Script Library');
+            ui.box.append(el('p',{text:'Built-in scripts are read-only. Imported or created scripts are stored locally in this browser for quick reuse. Scripts run in an isolated sandbox with a small allow-listed KanPaint API.'}));
+            const listRoot = el('div',{class:'kp-script-list'});
+            const footer = el('div',{class:'kp-modal-actions'});
+            const importBtn = button('Import .js'); const newBtn = button('New Script'); const backupBtn = button('Backup Library'); const restoreBtn = button('Restore Library'); const closeBtn = button('Close');
+            footer.append(importBtn,newBtn,backupBtn,restoreBtn,closeBtn); ui.box.append(listRoot,footer);
+            const render = () => {
+                listRoot.replaceChildren();
+                this.list().forEach(item => {
+                    const meta = el('div');
+                    const title = el('strong',{text:item.name}); if (item.builtin) title.append(el('span',{class:'kp-badge',text:'Built-in'}));
+                    meta.append(title, el('small',{text:item.description || (item.builtin ? 'KanPaint built-in script' : 'Saved locally')}));
+                    const actions = el('div',{class:'kp-script-actions'});
+                    const run = button('Run'); actions.append(run);
+                    run.addEventListener('click', async () => { run.disabled = true; try { await this.run(item.source,{name:item.name}); } catch(e){ console.error(e); } finally { run.disabled=false; } });
+                    if (item.builtin) {
+                        const copy = button('Copy to Library'); actions.append(copy);
+                        copy.addEventListener('click', () => {
+                            const users=this._loadUser(); users.push({id:`user.${Date.now()}`,name:`${item.name} Copy`,description:item.description,source:item.source});
+                            try { this._saveUser(users); render(); } catch(e){ OS.toast(e.message,'error'); }
+                        });
+                    } else {
+                        const edit = button('Edit'); const del = button('Delete','btn btn-danger'); actions.append(edit,del);
+                        edit.addEventListener('click',()=>this._showEditor(item, render));
+                        del.addEventListener('click',()=>{ const users=this._loadUser().filter(x=>x.id!==item.id); this._saveUser(users); render(); });
+                    }
+                    listRoot.append(el('div',{class:'kp-script-row'},[meta,actions]));
+                });
+            };
+            importBtn.addEventListener('click',()=>{
+                const input=el('input',{type:'file',accept:'.js,.kan.js,text/javascript,application/javascript'});
+                input.addEventListener('change',async()=>{ const file=input.files?.[0]; if(!file)return; if(file.size>SCRIPT_BYTES){OS.toast('Script is larger than 256 KiB','error');return;} const users=this._loadUser(); users.push({id:`user.${Date.now()}`,name:file.name.replace(/\.kan\.js$|\.js$/i,''),description:`Imported from ${file.name}`,source:await file.text()}); try{this._saveUser(users);render();}catch(e){OS.toast(e.message,'error');} }); input.click();
+            });
+            newBtn.addEventListener('click',()=>this._showEditor(null,render)); backupBtn.addEventListener('click',()=>this.exportLibrary()); restoreBtn.addEventListener('click',()=>this.importLibrary(render)); closeBtn.addEventListener('click',ui.close); render();
+        },
+        _showEditor(item, onSaved) {
+            const ui=modal(item ? 'Edit Script' : 'New Script');
+            const wrap=el('div',{class:'kp-script-editor'});
