@@ -1,0 +1,12 @@
+{
+  "name": "kanpaint-build",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "KanPaint overlay and reproducible build on top of OpenShop",
+  "scripts": {
+    "build": "node tools/build-kanpaint.mjs upstream dist",
+    "build:from": "node tools/build-kanpaint.mjs",
+    "check": "node --check src/kanpaint-v02.js"
+  }
+}
