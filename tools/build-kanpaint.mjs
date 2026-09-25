@@ -34,15 +34,15 @@ html = mustReplace(html, '<meta property="og:title" content="OpenShop | Private 
 html = mustReplace(html, '<meta property="og:site_name" content="OpenShop">', '<meta property="og:site_name" content="KanPaint">', 'og site');
 html = mustReplace(html, '<meta property="og:url" content="https://sysadmindoc.github.io/Openshop/">', '<meta property="og:url" content="https://lamhoailinh.github.io/KanPaint/">', 'og url');
 html = mustReplace(html, '<meta name="twitter:title" content="OpenShop | Private Browser Image Editor">', '<meta name="twitter:title" content="KanPaint | Browser Image Editor">', 'twitter title');
-html = mustReplace(html, '<title>OpenShop v0.41.0 | Browser Image Editor</title>', '<title>KanPaint v0.4 | Browser Image Editor</title>', 'title');
+html = mustReplace(html, '<title>OpenShop v0.31.0 | Browser Image Editor</title>', '<title>KanPaint v0.4 | Browser Image Editor</title>', 'title');
 html = mustReplace(html, '</title>\n<script>', '</title>\n<link rel="stylesheet" href="./kanpaint-v04.css">\n<script>', 'extension stylesheet');
 html = mustReplace(html,
 `    <div class="logo" aria-label="OpenShop version 0.31.0">
         <span class="logo-mark">OS</span>
         <span class="logo-word">OpenShop</span>
-        <span class="logo-version">v0.41</span>
+        <span class="logo-version">v0.31</span>
     </div>`,
-`    <div class="logo" aria-label="KanPaint version 0.2">
+`    <div class="logo" aria-label="KanPaint version 0.4">
         <span class="logo-mark">KP</span>
         <span class="logo-word">KanPaint</span>
         <span class="logo-version">v0.4</span>
