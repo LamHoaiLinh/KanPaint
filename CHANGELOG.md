@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.0
+- Added Photoshop-style red Skin Retouch mask overlay.
+- Added Alt+Brush mask erasing, Invert Mask, Feather and Density.
+- Feather/Density are saved as editable Retouch Layer metadata.
+- Added Before/After split comparison with draggable divider.
+- Added mask inspection/inversion Script API methods.
+- Updated build, smoke tests, artifact naming and Pages deployment for v0.5.
+
+# Changelog
+
 ## 0.4.0
 - Skin Retouch defaults to a separate editable non-destructive Retouch Layer.
 - Retouch layers persist target object ID, parameters and a compressed alpha mask.
