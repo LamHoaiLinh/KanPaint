@@ -1,13 +1,13 @@
 {
   "name": "kanpaint-build",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "type": "module",
-  "description": "KanPaint v0.4 build overlay on OpenShop with layer export, sandboxed scripts, and editable non-destructive Skin Retouch layers",
+  "description": "KanPaint v0.5 browser image editor with export layers, sandboxed scripts, and advanced non-destructive Skin Retouch masks",
   "scripts": {
     "build": "node tools/build-kanpaint.mjs upstream dist",
     "build:from": "node tools/build-kanpaint.mjs",
-    "check": "node --check src/kanpaint-v04.js",
+    "check": "node --check src/kanpaint-v05.js",
     "smoke": "node tools/smoke-check.mjs dist"
   }
 }
