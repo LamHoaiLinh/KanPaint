@@ -34,8 +34,8 @@ html = mustReplace(html, '<meta property="og:title" content="OpenShop | Private 
 html = mustReplace(html, '<meta property="og:site_name" content="OpenShop">', '<meta property="og:site_name" content="KanPaint">', 'og site');
 html = mustReplace(html, '<meta property="og:url" content="https://sysadmindoc.github.io/Openshop/">', '<meta property="og:url" content="https://lamhoailinh.github.io/KanPaint/">', 'og url');
 html = mustReplace(html, '<meta name="twitter:title" content="OpenShop | Private Browser Image Editor">', '<meta name="twitter:title" content="KanPaint | Browser Image Editor">', 'twitter title');
-html = mustReplace(html, '<title>OpenShop v0.31.0 | Browser Image Editor</title>', '<title>KanPaint v0.4 | Browser Image Editor</title>', 'title');
-html = mustReplace(html, '</title>\n<script>', '</title>\n<link rel="stylesheet" href="./kanpaint-v04.css">\n<script>', 'extension stylesheet');
+html = mustReplace(html, '<title>OpenShop v0.31.0 | Browser Image Editor</title>', '<title>KanPaint v0.5 | Browser Image Editor</title>', 'title');
+html = mustReplace(html, '</title>\n<script>', '</title>\n<link rel="stylesheet" href="./kanpaint-v05.css">\n<script>', 'extension stylesheet');
 html = mustReplace(html,
 `    <div class="logo" aria-label="OpenShop version 0.31.0">
         <span class="logo-mark">OS</span>
@@ -45,21 +45,21 @@ html = mustReplace(html,
 `    <div class="logo" aria-label="KanPaint version 0.4">
         <span class="logo-mark">KP</span>
         <span class="logo-word">KanPaint</span>
-        <span class="logo-version">v0.4</span>
+        <span class="logo-version">v0.5</span>
     </div>`,
   'logo');
-html = mustReplace(html, '</script>\n</body>\n</html>', '</script>\n<script src="./kanpaint-v04.js"></script>\n</body>\n</html>', 'extension script');
+html = mustReplace(html, '</script>\n</body>\n</html>', '</script>\n<script src="./kanpaint-v05.js"></script>\n</body>\n</html>', 'extension script');
 write('index.html', html);
 
 const srcDir = path.join(root, 'src');
-fs.copyFileSync(path.join(srcDir, 'kanpaint-v04.js'), path.join(out, 'kanpaint-v04.js'));
-fs.copyFileSync(path.join(srcDir, 'kanpaint-v04.css'), path.join(out, 'kanpaint-v04.css'));
+fs.copyFileSync(path.join(srcDir, 'kanpaint-v05.js'), path.join(out, 'kanpaint-v05.js'));
+fs.copyFileSync(path.join(srcDir, 'kanpaint-v05.css'), path.join(out, 'kanpaint-v05.css'));
 
 const packagePath = path.join(out, 'package.json');
 if (fs.existsSync(packagePath)) {
   const pkg = JSON.parse(fs.readFileSync(packagePath, 'utf8'));
   pkg.name = 'kanpaint';
-  pkg.version = '0.4.0';
+  pkg.version = '0.5.0';
   pkg.description = 'Browser image editor based on OpenShop with layer export, sandboxed scripts, and skin retouch tools';
   fs.writeFileSync(packagePath, `${JSON.stringify(pkg, null, 2)}\n`);
 }
@@ -69,7 +69,7 @@ if (fs.existsSync(manifestPath)) {
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
   manifest.name = 'KanPaint Image Editor';
   manifest.short_name = 'KanPaint';
-  manifest.version = '0.4.0';
+  manifest.version = '0.5.0';
   manifest.description = 'Browser image editing with layers, export-layers, sandboxed scripts, PSD interchange, and skin retouch.';
   fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 }
@@ -78,8 +78,8 @@ const runtimePath = path.join(out, 'tools', 'runtime-assets.mjs');
 if (fs.existsSync(runtimePath)) {
   let runtime = fs.readFileSync(runtimePath, 'utf8');
   const anchor = "  './plugin-sandbox.js',\n";
-  if (!runtime.includes("'./kanpaint-v04.js'")) {
-    runtime = mustReplace(runtime, anchor, `${anchor}  './kanpaint-v04.js',\n  './kanpaint-v04.css',\n`, 'runtime asset list');
+  if (!runtime.includes("'./kanpaint-v05.js'")) {
+    runtime = mustReplace(runtime, anchor, `${anchor}  './kanpaint-v05.js',\n  './kanpaint-v05.css',\n`, 'runtime asset list');
   }
   fs.writeFileSync(runtimePath, runtime);
 }
@@ -87,22 +87,22 @@ if (fs.existsSync(runtimePath)) {
 const swPath = path.join(out, 'sw.js');
 if (fs.existsSync(swPath)) {
   let sw = fs.readFileSync(swPath, 'utf8');
-  sw = mustReplace(sw, "const SHELL_REVISION = '0.31.0-r1';", "const SHELL_REVISION = '0.4.0-r1';", 'service worker revision');
+  sw = mustReplace(sw, "const SHELL_REVISION = '0.31.0-r1';", "const SHELL_REVISION = '0.5.0-r1';", 'service worker revision');
   const revAnchor = "    SHELL_REVISION,\n";
   if (!sw.includes("    '0.31.0-r1',"))
     sw = mustReplace(sw, revAnchor, `${revAnchor}    '0.31.0-r1',\n`, 'rollback revision');
   const assetAnchor = '    "./index.html",\n';
-  if (!sw.includes('"./kanpaint-v04.js"'))
-    sw = mustReplace(sw, assetAnchor, `${assetAnchor}    "./kanpaint-v04.js",\n    "./kanpaint-v04.css",\n`, 'service worker assets');
+  if (!sw.includes('"./kanpaint-v05.js"'))
+    sw = mustReplace(sw, assetAnchor, `${assetAnchor}    "./kanpaint-v05.js",\n    "./kanpaint-v05.css",\n`, 'service worker assets');
   fs.writeFileSync(swPath, sw);
 }
 
 fs.writeFileSync(path.join(out, 'KANPAINT_BUILD.txt'), [
-  'KanPaint v0.4.0',
+  'KanPaint v0.5.0',
   'Based on OpenShop 0.31.0',
   'KanPaint extensions: Export Layers + Auto Trim, sandboxed Scripts + Script Library, Skin Retouch.',
   'See repository NOTICE.md and upstream LICENSE.',
   '',
 ].join('\n'));
 
-console.log(`KanPaint v0.4 built at ${out}`);
+console.log(`KanPaint v0.5 built at ${out}`);
