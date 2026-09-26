@@ -1,6 +1,12 @@
 # Changelog
 
 ## 0.1.0 — First usable release
+
+### Dropzone hotfix
+- Fixed the full-screen “Drop files here” overlay remaining visible after a file was successfully added to the canvas.
+- Added capture-phase and next-frame safety cleanup so future canvas handlers cannot leave the overlay stuck.
+- Forced the pastel-green palette across upstream saved theme classes.
+- Bumped the offline shell revision so browsers receive the fix instead of serving the previous cached build.
 KanPaint reset version line về **0.1**. Các version 0.2–0.5 trước đây là prototype nội bộ trong quá trình xây nền.
 
 ### Editor & UI

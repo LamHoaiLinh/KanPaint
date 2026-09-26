@@ -1,5 +1,49 @@
 
 /* KanPaint 0.1 pastel-green studio theme */
+/* Keep the KanPaint pastel palette even when upstream restores a saved theme class. */
+:root,
+:root.theme-midnight,
+:root.theme-oled,
+:root.theme-light,
+:root[data-os-theme]{
+  color-scheme:light!important;
+  --bg-depth-0:#edf8ef!important;
+  --bg-depth-1:#f7fcf8!important;
+  --bg-depth-2:#e5f3e8!important;
+  --bg-depth-3:#d7ebdc!important;
+  --bg-depth-4:#cbe7d1!important;
+  --surface:#f7fcf8!important;
+  --surface-2:#eaf6ed!important;
+  --panel:#f7fcf8!important;
+  --panel-bg:#f7fcf8!important;
+  --toolbar-bg:#e3f2e7!important;
+  --menu-bg:#f5fbf6!important;
+  --border:#b9d8c0!important;
+  --border-active:#8fbea0!important;
+  --text-primary:#20382a!important;
+  --text-secondary:#456451!important;
+  --text-muted:#6b8473!important;
+  --accent:#6eaf81!important;
+  --accent-hover:#55986a!important;
+  --accent-dim:rgba(110,175,129,.18)!important;
+  --canvas-bg:#dcebe0!important;
+  --checker-a:#c9dfcf!important;
+  --checker-b:#eef8f0!important;
+  --guide:#4b9a69!important;
+  --smart-guide:#2e7d55!important;
+  --theme-color:#edf8ef!important;
+}
+#dropzone-overlay{
+  background:rgba(237,248,239,.96)!important;
+  color:#20382a!important;
+  backdrop-filter:blur(10px)!important;
+}
+#dropzone-overlay .dropzone-ring{border-color:#6eaf81!important}
+#dropzone-overlay .dropzone-ring svg{color:#55986a!important}
+#dropzone-overlay .dropzone-text{color:#20382a!important}
+#dropzone-overlay .dropzone-sub{color:#65806d!important}
+
+
 :root{
   --kp-green-0:#f7fcf8;
   --kp-green-1:#edf8ef;

@@ -35,6 +35,12 @@ html = mustReplace(html, '<meta property="og:site_name" content="OpenShop">', '<
 html = mustReplace(html, '<meta property="og:url" content="https://sysadmindoc.github.io/Openshop/">', '<meta property="og:url" content="https://lamhoailinh.github.io/KanPaint/">', 'og url');
 html = mustReplace(html, '<meta name="twitter:title" content="OpenShop | Private Browser Image Editor">', '<meta name="twitter:title" content="KanPaint | Browser Image Editor">', 'twitter title');
 html = mustReplace(html, '<title>OpenShop v0.31.0 | Browser Image Editor</title>', '<title>KanPaint v0.1 | Browser Image Editor</title>', 'title');
+html = mustReplace(
+  html,
+  "ca.addEventListener('drop', e => { e.preventDefault(); e.stopPropagation(); this.handleDrop(e); });",
+  "ca.addEventListener('drop', e => { e.preventDefault(); document.getElementById('dropzone-overlay')?.classList.remove('visible'); e.stopPropagation(); void this.handleDrop(e); });",
+  'drop overlay cleanup'
+);
 html = mustReplace(html, '</title>\n<script>', '</title>\n<link rel="stylesheet" href="./kanpaint-v01.css">\n<script>', 'extension stylesheet');
 html = mustReplace(html,
 `    <div class="logo" aria-label="OpenShop version 0.31.0">
@@ -87,10 +93,10 @@ if (fs.existsSync(runtimePath)) {
 const swPath = path.join(out, 'sw.js');
 if (fs.existsSync(swPath)) {
   let sw = fs.readFileSync(swPath, 'utf8');
-  sw = mustReplace(sw, "const SHELL_REVISION = '0.31.0-r1';", "const SHELL_REVISION = '0.1.0-r1';", 'service worker revision');
+  sw = mustReplace(sw, "const SHELL_REVISION = '0.31.0-r1';", "const SHELL_REVISION = '0.1.0-r2';", 'service worker revision');
   const revAnchor = "    SHELL_REVISION,\n";
   if (!sw.includes("    '0.31.0-r1',"))
-    sw = mustReplace(sw, revAnchor, `${revAnchor}    '0.31.0-r1',\n`, 'rollback revision');
+    sw = mustReplace(sw, revAnchor, `${revAnchor}    '0.31.0-r1',\n    '0.1.0-r1',\n`, 'rollback revision');
   const assetAnchor = '    "./index.html",\n';
   if (!sw.includes('"./kanpaint-v01.js"'))
     sw = mustReplace(sw, assetAnchor, `${assetAnchor}    "./kanpaint-v01.js",\n    "./kanpaint-v01.css",\n`, 'service worker assets');

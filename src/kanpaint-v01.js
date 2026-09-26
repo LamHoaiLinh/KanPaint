@@ -48,6 +48,27 @@
     };
     const button = (label, className = 'btn') => el('button', { type:'button', class:className, text:label });
 
+    const hideDropOverlay = () => {
+        const overlay = document.getElementById('dropzone-overlay');
+        if (overlay) overlay.classList.remove('visible');
+    };
+    function installDropzoneSafety() {
+        // OpenShop's canvas drop handler stops propagation. A document-level
+        // bubble listener therefore cannot clear the full-screen drop overlay
+        // after a successful canvas drop. Capture-phase cleanup always runs
+        // first and a second cleanup on the next frame prevents stale overlays.
+        const clear = () => {
+            hideDropOverlay();
+            requestAnimationFrame(hideDropOverlay);
+        };
+        document.addEventListener('drop', clear, true);
+        document.addEventListener('dragend', clear, true);
+        window.addEventListener('blur', clear);
+        document.addEventListener('keydown', event => {
+            if (event.key === 'Escape') clear();
+        }, true);
+    }
+
     function closeModal(overlay) {
         if (!overlay) return;
         overlay.remove();
@@ -1297,6 +1318,7 @@
     }
 
     // Patch methods before OS.init binds them to Fabric events.
+    installDropzoneSafety();
     patchCoreForSkin();
     Automation.install();
     addFileMenu();
