@@ -365,3 +365,61 @@ input[type="text"],input[type="number"],input[type="search"],select,textarea{
   opacity:.48!important;
   cursor:not-allowed!important;
 }
+
+
+/* ===== KanPaint dark application chrome =====
+   Keep the editing chrome consistent with the dark workspace while the
+   welcome/content surfaces may retain the pastel KanPaint identity. */
+#topbar{
+  background:linear-gradient(180deg,#111923,#0a1018)!important;
+  border-bottom:1px solid #2b3949!important;
+  color:#d7e0e8!important;
+  box-shadow:0 7px 20px rgba(0,0,0,.28)!important;
+}
+#topbar .logo-word{color:#e8f1eb!important}
+#topbar .logo-version{color:#92a59a!important}
+#topbar .logo-mark{
+  background:#4d8f63!important;
+  color:#f4fff7!important;
+  border-color:#74b389!important;
+}
+#topbar .menu-item{
+  color:#b9c5d1!important;
+}
+#topbar .menu-item:hover,
+#topbar .menu-item.open{
+  background:#1a2634!important;
+  color:#fff!important;
+}
+#topbar .menu-dropdown{
+  background:#0d141e!important;
+  border-color:#344255!important;
+  box-shadow:0 14px 38px rgba(0,0,0,.5)!important;
+}
+#topbar .dd-item{
+  color:#c5d0dc!important;
+}
+#topbar .dd-item:hover{
+  background:#1a2634!important;
+  color:#fff!important;
+}
+#topbar .dd-shortcut,
+#topbar .dd-note{
+  color:#8190a0!important;
+}
+#topbar #workspace-selector-wrap,
+#topbar #command-launch,
+#topbar .local-badge{
+  background:#111a24!important;
+  border-color:#344255!important;
+  color:#aebbc7!important;
+}
+#topbar #workspace-selector-wrap select,
+#topbar #command-launch input{
+  color:#dce5ed!important;
+  background:#111a24!important;
+}
+#topbar #workspace-selector-wrap option{
+  color:#dce5ed!important;
+  background:#111a24!important;
+}

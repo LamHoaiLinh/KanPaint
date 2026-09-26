@@ -26,3 +26,14 @@ const css=fs.readFileSync(path.join(dir,'kanpaint-v01.css'),'utf8');
 for(const token of ['KanPaint 0.1 desktop toolbox usability fix','#flyout-host .audit-tool-flyout','--toolbar-w:156px']){
   if(!css.includes(token)) throw new Error('KanPaint toolbox CSS missing token: '+token);
 }
+
+for(const file of ['vendor/boot/fabric-7.4.0.min.js','vendor/boot/ag-psd-31.0.2.min.js','vendor/boot/jspdf-4.2.1.umd.min.js']){
+  const full=path.join(dir,file);
+  if(!fs.existsSync(full) || fs.statSync(full).size<10000) throw new Error('Missing vendored boot asset: '+file);
+}
+for(const token of ['./vendor/boot/fabric-7.4.0.min.js','./vendor/boot/ag-psd-31.0.2.min.js','./vendor/boot/jspdf-4.2.1.umd.min.js','Welcome to KanPaint']){
+  if(!html.includes(token)) throw new Error('Built app missing local boot/branding token: '+token);
+}
+if(html.includes('https://cdn.jsdelivr.net/npm/fabric@7.4.0/dist/index.min.js')) throw new Error('Fabric boot still depends on remote CDN');
+const cssText=fs.readFileSync(path.join(dir,'kanpaint-v01.css'),'utf8');
+if(!cssText.includes('KanPaint dark application chrome')) throw new Error('Dark top chrome CSS missing');

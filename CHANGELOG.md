@@ -2,6 +2,13 @@
 
 ## 0.1.0 — First usable release
 
+### Startup reliability hotfix
+- Vendored the three startup-critical libraries (Fabric.js, ag-psd and jsPDF) into the built KanPaint site so the welcome screen no longer waits on jsDelivr before the editor can initialize.
+- Build-time SHA-384 verification keeps the same pinned-integrity guarantee while runtime loading becomes same-origin.
+- Pre-cached the boot libraries in the service worker and bumped the shell revision.
+- Rebranded the welcome screen to KanPaint.
+- Changed the File/Edit/Select/Image/Filter/AI/View application bar and its dropdowns to dark chrome matching the workspace.
+
 ### Toolbox usability hotfix
 - Changed the desktop toolbox to a dark workspace-style surface while keeping the rest of KanPaint pastel green.
 - Enlarged the desktop toolbox from the cramped 104px two-column layout to a 144px two-column layout with larger icons and readable family labels.

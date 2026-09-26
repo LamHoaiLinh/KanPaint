@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 
 const root = path.resolve(import.meta.dirname, '..');
 const upstream = path.resolve(process.argv[2] || path.join(root, 'upstream'));
@@ -25,6 +26,41 @@ const mustReplace = (value, search, replacement, label) => {
   return value.replace(search, replacement);
 };
 
+const BOOT_VENDOR_ASSETS = [
+  {
+    name:'Fabric.js',
+    url:'https://cdn.jsdelivr.net/npm/fabric@7.4.0/dist/index.min.js',
+    integrity:'sha384-T2IWa4YW4tn/gJpR880CrMehXQvwxwaRgQszdzYPA6jBbKH9sPZuTf9YrN/PqNP6',
+    file:'fabric-7.4.0.min.js'
+  },
+  {
+    name:'ag-psd',
+    url:'https://cdn.jsdelivr.net/npm/ag-psd@31.0.2/dist/bundle.js',
+    integrity:'sha384-9dhx2Gx3cKvCuBJwLZxPUmqz77LqKJIAzYABzUhCaCPDK5Rz+CFt6/jeKu84tBA6',
+    file:'ag-psd-31.0.2.min.js'
+  },
+  {
+    name:'jsPDF',
+    url:'https://cdn.jsdelivr.net/npm/jspdf@4.2.1/dist/jspdf.umd.min.js',
+    integrity:'sha384-qovJwSBbRDPP5cEjCp8S0UP66wrvnjaa60XMOGzTNanrThcrGfXfnZkvgY8N1KT3',
+    file:'jspdf-4.2.1.umd.min.js'
+  }
+];
+
+const vendorBootAssets = async () => {
+  const dir=path.join(out,'vendor','boot');
+  fs.mkdirSync(dir,{recursive:true});
+  for(const asset of BOOT_VENDOR_ASSETS){
+    const response=await fetch(asset.url,{signal:AbortSignal.timeout(30000)});
+    if(!response.ok) throw new Error(`Could not vendor ${asset.name}: HTTP ${response.status}`);
+    const bytes=Buffer.from(await response.arrayBuffer());
+    const sri='sha384-'+createHash('sha384').update(bytes).digest('base64');
+    if(sri!==asset.integrity) throw new Error(`Integrity mismatch while vendoring ${asset.name}`);
+    fs.writeFileSync(path.join(dir,asset.file),bytes);
+  }
+};
+await vendorBootAssets();
+
 let html = read('index.html');
 html = mustReplace(html,
   '<meta name="description" content="OpenShop is a private browser image editor with layers, selections, PSD interchange, local export, and an installable offline shell.">',
@@ -35,6 +71,26 @@ html = mustReplace(html, '<meta property="og:site_name" content="OpenShop">', '<
 html = mustReplace(html, '<meta property="og:url" content="https://sysadmindoc.github.io/Openshop/">', '<meta property="og:url" content="https://lamhoailinh.github.io/KanPaint/">', 'og url');
 html = mustReplace(html, '<meta name="twitter:title" content="OpenShop | Private Browser Image Editor">', '<meta name="twitter:title" content="KanPaint | Browser Image Editor">', 'twitter title');
 html = mustReplace(html, '<title>OpenShop v0.31.0 | Browser Image Editor</title>', '<title>KanPaint v0.1 | Browser Image Editor</title>', 'title');
+html = mustReplace(html,
+  'https://cdn.jsdelivr.net/npm/fabric@7.4.0/dist/index.min.js',
+  './vendor/boot/fabric-7.4.0.min.js',
+  'boot asset Fabric.js URL');
+html = mustReplace(html,
+  'https://cdn.jsdelivr.net/npm/ag-psd@31.0.2/dist/bundle.js',
+  './vendor/boot/ag-psd-31.0.2.min.js',
+  'boot asset ag-psd URL');
+html = mustReplace(html,
+  'https://cdn.jsdelivr.net/npm/jspdf@4.2.1/dist/jspdf.umd.min.js',
+  './vendor/boot/jspdf-4.2.1.umd.min.js',
+  'boot asset jsPDF URL');
+html = mustReplace(html,
+  '<div id="welcome-overlay" role="dialog" aria-modal="true" aria-label="Welcome to OpenShop">',
+  '<div id="welcome-overlay" role="dialog" aria-modal="true" aria-label="Welcome to KanPaint">',
+  'welcome aria branding');
+html = mustReplace(html,
+  '<div class="welcome-brand"><span class="welcome-mark">OS</span><span>OpenShop</span><small>v0.31</small></div>',
+  '<div class="welcome-brand"><span class="welcome-mark">KP</span><span>KanPaint</span><small>v0.1</small></div>',
+  'welcome branding');
 html = mustReplace(
   html,
   "ca.addEventListener('drop', e => { e.preventDefault(); e.stopPropagation(); this.handleDrop(e); });",
@@ -93,13 +149,15 @@ if (fs.existsSync(runtimePath)) {
 const swPath = path.join(out, 'sw.js');
 if (fs.existsSync(swPath)) {
   let sw = fs.readFileSync(swPath, 'utf8');
-  sw = mustReplace(sw, "const SHELL_REVISION = '0.31.0-r1';", "const SHELL_REVISION = '0.1.0-r2';", 'service worker revision');
+  sw = mustReplace(sw, "const SHELL_REVISION = '0.31.0-r1';", "const SHELL_REVISION = '0.1.0-r3';", 'service worker revision');
   const revAnchor = "    SHELL_REVISION,\n";
   if (!sw.includes("    '0.31.0-r1',"))
     sw = mustReplace(sw, revAnchor, `${revAnchor}    '0.31.0-r1',\n    '0.1.0-r1',\n`, 'rollback revision');
   const assetAnchor = '    "./index.html",\n';
   if (!sw.includes('"./kanpaint-v01.js"'))
     sw = mustReplace(sw, assetAnchor, `${assetAnchor}    "./kanpaint-v01.js",\n    "./kanpaint-v01.css",\n`, 'service worker assets');
+  if (!sw.includes('"./vendor/boot/fabric-7.4.0.min.js"'))
+    sw = mustReplace(sw, assetAnchor, `${assetAnchor}    "./vendor/boot/fabric-7.4.0.min.js",\n    "./vendor/boot/ag-psd-31.0.2.min.js",\n    "./vendor/boot/jspdf-4.2.1.umd.min.js",\n`, 'service worker boot vendor assets');
   fs.writeFileSync(swPath, sw);
 }
 
@@ -107,6 +165,7 @@ fs.writeFileSync(path.join(out, 'KANPAINT_BUILD.txt'), [
   'KanPaint v0.1.0',
   'Based on OpenShop 0.31.0',
   'KanPaint extensions: Export Layers + Auto Trim, sandboxed Scripts + Script Library, Skin Retouch.',
+  'Boot libraries: same-origin vendored Fabric.js, ag-psd and jsPDF for fast reliable startup.',
   'See repository NOTICE.md and upstream LICENSE.',
   '',
 ].join('\n'));
