@@ -996,6 +996,23 @@
             }
             OS.canvas?.requestRenderAll?.(); OS.saveHistory?.('Resize Layer'); return true;
         },
+        async _trimLayer(id,args={}) {
+            const index=this._layerIndex(id),layer=OS.layers[index],objects=(layer.objects||[]).filter(o=>o?.name!=='__boundary__');
+            if(!objects.length) throw new Error('Layer has no drawable objects');
+            const rects=objects.map(o=>o.getBoundingRect?.()).filter(Boolean);
+            if(!rects.length) throw new Error('Layer bounds unavailable');
+            const minX=Math.min(...rects.map(r=>r.left)),minY=Math.min(...rects.map(r=>r.top)),maxX=Math.max(...rects.map(r=>r.left+r.width)),maxY=Math.max(...rects.map(r=>r.top+r.height));
+            const padding=Math.max(0,Math.min(256,Math.round(Number(args.padding)||0)));
+            const canvas=LayerExport._renderOne(layer,{trim:true,padding});
+            if(!canvas) throw new Error('Layer is empty');
+            const image=await fabric.FabricImage.fromURL(canvas.toDataURL('image/png'));
+            image.set({left:minX-padding,top:minY-padding,originX:'left',originY:'top',selectable:true,evented:true,name:layer.name||'Trimmed Layer'});
+            image._openShopObjectId=OS._newDocumentId?.('object')||('object-'+Date.now());
+            objects.forEach(o=>OS.canvas?.remove(o)); OS.canvas?.add(image); layer.objects=[image];
+            OS.activeLayerIdx=index;OS._selectedLayerIds=[layer.id];OS.canvas?.setActiveObject?.(image);
+            OS._enforceLayerInvariants?.();OS.updateLayersPanel?.();OS.canvas?.requestRenderAll?.();OS.saveHistory?.('Trim Layer');
+            return {id:layer.id,width:canvas.width,height:canvas.height,padding};
+        },
         _selectionObject() {
             const m=OS._selectionMask;
             if(m?.mask&&m.w&&m.h) return {w:m.w,h:m.h,mask:new Uint8Array(m.mask)};
@@ -1041,10 +1058,15 @@
             const ctx=c.getContext('2d',{willReadFrequently:true});
             if(kind==='blur'){ctx.filter='blur('+clamp(args.radius||2,0,50)+'px)';ctx.drawImage(image,0,0,c.width,c.height);}
             else if(kind==='brightnessContrast'){ctx.filter='brightness('+(100+clamp(args.brightness||0,-100,100))+'%) contrast('+(100+clamp(args.contrast||0,-100,100))+'%)';ctx.drawImage(image,0,0,c.width,c.height);}
+            else if(kind==='hueSaturation'){ctx.filter='hue-rotate('+clamp(args.hue||0,-180,180)+'deg) saturate('+(100+clamp(args.saturation||0,-100,200))+'%)';ctx.drawImage(image,0,0,c.width,c.height);}
             else {
                 ctx.drawImage(image,0,0,c.width,c.height);const data=ctx.getImageData(0,0,c.width,c.height),d=data.data;
                 if(kind==='invert')for(let i=0;i<d.length;i+=4){d[i]=255-d[i];d[i+1]=255-d[i+1];d[i+2]=255-d[i+2];}
                 else if(kind==='grayscale')for(let i=0;i<d.length;i+=4){const v=Math.round(d[i]*.2126+d[i+1]*.7152+d[i+2]*.0722);d[i]=d[i+1]=d[i+2]=v;}
+                else if(kind==='sharpen'){
+                    const src=new Uint8ClampedArray(d),w=c.width,h=c.height,amount=clamp(args.amount||40,0,100)/100;
+                    for(let y=1;y<h-1;y++)for(let x=1;x<w-1;x++){const p=(y*w+x)*4;for(let ch=0;ch<3;ch++){const center=src[p+ch]*5-src[p-4+ch]-src[p+4+ch]-src[p-w*4+ch]-src[p+w*4+ch];d[p+ch]=clamp(src[p+ch]+(center-src[p+ch])*amount,0,255);}}
+                }
                 else throw new Error('Unsupported filter: '+kind);
                 ctx.putImageData(data,0,0);
             }
@@ -1103,6 +1125,8 @@
             const ui=modal('Script & Automation Hotkeys'),map=this._loadHotkeys(),body=el('div');
             const commands=[['recent','Run Last Script'],['library','Script Library'],['export','Export Layers'],['batch','Batch Runner'],['skin','Skin Retouch'],['help','KanPaint Guide']];
             for(const [id,label] of commands){const current=Object.entries(map).find(([,v])=>v===id)?.[0]||'';const input=el('input',{type:'text',value:current,placeholder:'Ctrl+Alt+…'});input.addEventListener('keydown',e=>{e.preventDefault();input.value=this._combo(e);});body.append(el('div',{class:'kp-form-row'},[el('label',{text:label}),input]));input.dataset.command=id;}
+            body.append(el('div',{class:'kp-section-title',text:'SCRIPTS'}));
+            for(const script of ScriptEngine.list()){const command='script:'+script.id,current=Object.entries(map).find(([,v])=>v===command)?.[0]||'',input=el('input',{type:'text',value:current,placeholder:'Optional'});input.addEventListener('keydown',e=>{e.preventDefault();input.value=this._combo(e);});input.dataset.command=command;body.append(el('div',{class:'kp-form-row'},[el('label',{text:script.name}),input]));}
             const save=button('Save','btn btn-primary'),close=button('Cancel');save.addEventListener('click',()=>{const next={};body.querySelectorAll('input[data-command]').forEach(i=>{if(i.value.trim())next[i.value.trim()]=i.dataset.command;});this._saveHotkeys(next);ui.close();OS.toast('Hotkeys saved','success');});close.addEventListener('click',ui.close);ui.box.append(body,el('div',{class:'kp-modal-actions'},[close,save]));
         },
         showEvents() {
@@ -1155,6 +1179,7 @@
                 if(method==='layers.duplicate')return this._duplicateLayer(args.id);
                 if(method==='layers.remove')return this._removeLayer(args.id);
                 if(method==='layers.resize')return this._resizeLayer(args.id,args);
+                if(method==='layers.trim')return this._trimLayer(args.id,args);
                 if(method==='selection.clear')return this._setSelection(null);
                 if(method==='selection.selectAll'){const w=Math.max(1,Math.round(OS.canvasW||1)),h=Math.max(1,Math.round(OS.canvasH||1)),mask=new Uint8Array(w*h);mask.fill(255);return this._setSelection({w,h,mask});}
                 if(method==='selection.invert'){let s=this._selectionObject();if(!s){const w=Math.max(1,Math.round(OS.canvasW||1)),h=Math.max(1,Math.round(OS.canvasH||1)),mask=new Uint8Array(w*h);mask.fill(255);s={w,h,mask};}else for(let i=0;i<s.mask.length;i++)s.mask[i]=255-s.mask[i];return this._setSelection(s);}
@@ -1174,11 +1199,12 @@
                 let out=oldWrapped(source);
                 out=out.replace("  version:'"+VERSION+"',\n","  version:'"+VERSION+"',\n  apiVersion:'"+API_VERSION+"',\n  app:Object.freeze({info:()=>request('app.info')}),\n");
                 out=out.replace("  document:Object.freeze({info:()=>request('document.info')}),\n","  document:Object.freeze({info:()=>request('document.info'),resize:(width,height)=>request('document.resize',{width,height})}),\n");
-                out=out.replace(/  layers:Object\.freeze\(\{[^\n]+\}\),\n/, "  layers:Object.freeze({list:()=>request('layers.list'),getAll:()=>request('layers.list'),active:()=>request('layers.active'),select:(id)=>request('layers.select',{id}),rename:(id,name)=>request('layers.rename',{id,name}),setVisible:(id,visible)=>request('layers.setVisible',{id,visible}),setLocked:(id,locked)=>request('layers.setLocked',{id,locked}),setOpacity:(id,opacity)=>request('layers.setOpacity',{id,opacity}),move:(id,toIndex)=>request('layers.move',{id,toIndex}),duplicate:(id)=>request('layers.duplicate',{id}),remove:(id)=>request('layers.remove',{id}),resize:(id,o={})=>request('layers.resize',{id,...o}),export:(o={})=>request('layers.export',o)}),\n");
+                out=out.replace(/  layers:Object\.freeze\(\{[^\n]+\}\),\n/, "  layers:Object.freeze({list:()=>request('layers.list'),getAll:()=>request('layers.list'),active:()=>request('layers.active'),select:(id)=>request('layers.select',{id}),rename:(id,name)=>request('layers.rename',{id,name}),setVisible:(id,visible)=>request('layers.setVisible',{id,visible}),setLocked:(id,locked)=>request('layers.setLocked',{id,locked}),setOpacity:(id,opacity)=>request('layers.setOpacity',{id,opacity}),move:(id,toIndex)=>request('layers.move',{id,toIndex}),duplicate:(id)=>request('layers.duplicate',{id}),remove:(id)=>request('layers.remove',{id}),resize:(id,o={})=>request('layers.resize',{id,...o}),trim:(id,o={})=>request('layers.trim',{id,...o}),export:(o={})=>request('layers.export',o)}),\n");
                 out=out.replace(/  selection:Object\.freeze\(\{[^\n]+\}\),\n/, "  selection:Object.freeze({info:()=>request('selection.info'),clear:()=>request('selection.clear'),selectAll:()=>request('selection.selectAll'),invert:()=>request('selection.invert'),expand:(px)=>request('selection.expand',{px}),contract:(px)=>request('selection.contract',{px}),feather:(px)=>request('selection.feather',{px})}),\n");
                 out=out.replace("  ui:Object.freeze({toast:(message,type='info')=>request('ui.toast',{message,type})})\n",
-"  filters:Object.freeze({apply:(kind,o={})=>request('filters.apply',{kind,...o}),brightnessContrast:(o={})=>request('filters.apply',{kind:'brightnessContrast',...o}),blur:(radius=2)=>request('filters.apply',{kind:'blur',radius}),grayscale:()=>request('filters.apply',{kind:'grayscale'}),invert:()=>request('filters.apply',{kind:'invert'})}),\n  export:Object.freeze({layers:(o={})=>request('export.layers',o),selected:(o={})=>request('export.layers',{scope:'selected',...o}),visible:(o={})=>request('export.layers',{scope:'visible',...o}),all:(o={})=>request('export.layers',{scope:'all',...o})}),\n  batch:Object.freeze({pickAndRun:(commands,o={})=>request('batch.pickAndRun',{commands,...o}),pickFolderAndRun:(commands,o={})=>request('batch.pickFolderAndRun',{commands,...o})}),\n  ui:Object.freeze({toast:(message,type='info')=>request('ui.toast',{message,type})})\n");
-                out=out.replace("});\n(async()=>{ try {","});\nkan.v1=Object.freeze({app:kan.app,document:kan.document,layers:kan.layers,selection:kan.selection,filters:kan.filters,export:kan.export,batch:kan.batch,skin:kan.skin,ui:kan.ui});\n(async()=>{ try {");
+"  filters:Object.freeze({apply:(kind,o={})=>request('filters.apply',{kind,...o}),brightnessContrast:(o={})=>request('filters.apply',{kind:'brightnessContrast',...o}),blur:(radius=2)=>request('filters.apply',{kind:'blur',radius}),grayscale:()=>request('filters.apply',{kind:'grayscale'}),invert:()=>request('filters.apply',{kind:'invert'}),hueSaturation:(o={})=>request('filters.apply',{kind:'hueSaturation',...o}),sharpen:(amount=40)=>request('filters.apply',{kind:'sharpen',amount})}),\n  export:Object.freeze({layers:(o={})=>request('export.layers',o),selected:(o={})=>request('export.layers',{scope:'selected',...o}),visible:(o={})=>request('export.layers',{scope:'visible',...o}),all:(o={})=>request('export.layers',{scope:'all',...o})}),\n  batch:Object.freeze({pickAndRun:(commands,o={})=>request('batch.pickAndRun',{commands,...o}),pickFolderAndRun:(commands,o={})=>request('batch.pickFolderAndRun',{commands,...o})}),\n  ui:Object.freeze({toast:(message,type='info')=>request('ui.toast',{message,type})})\n");
+                out=out.replace("const kan = Object.freeze({\\n","const api = {\\n");
+                out=out.replace("});\\n(async()=>{ try {","};\\napi.v1=Object.freeze({app:api.app,document:api.document,layers:api.layers,selection:api.selection,filters:api.filters,export:api.export,batch:api.batch,skin:api.skin,ui:api.ui});\\nconst kan=Object.freeze(api);\\n(async()=>{ try {");
                 return out;
             };
 
