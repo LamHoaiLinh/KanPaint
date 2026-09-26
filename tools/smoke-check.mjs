@@ -21,3 +21,8 @@ console.log('KanPaint v0.1 smoke check passed.');
 if(!html.includes("dropzone-overlay')?.classList.remove('visible')")) {
   throw new Error('Built app is missing canvas-drop overlay cleanup');
 }
+
+const css=fs.readFileSync(path.join(dir,'kanpaint-v01.css'),'utf8');
+for(const token of ['KanPaint 0.1 desktop toolbox usability fix','#flyout-host .audit-tool-flyout','--toolbar-w:156px']){
+  if(!css.includes(token)) throw new Error('KanPaint toolbox CSS missing token: '+token);
+}

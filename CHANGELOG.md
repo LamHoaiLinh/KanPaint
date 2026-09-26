@@ -2,6 +2,12 @@
 
 ## 0.1.0 — First usable release
 
+### Toolbox usability hotfix
+- Changed the desktop toolbox to a dark workspace-style surface while keeping the rest of KanPaint pastel green.
+- Enlarged the desktop toolbox from the cramped 104px two-column layout to a 144px two-column layout with larger icons and readable family labels.
+- Fixed registry flyouts after OpenShop portals them into `#flyout-host`; the original descendant CSS no longer matched after the move, which collapsed choices to roughly icon width.
+- Tool flyouts now use a dark 276px panel, 38px rows, readable 12px names, visible shortcuts and no duplicate tooltip text.
+
 ### Dropzone hotfix
 - Fixed the full-screen “Drop files here” overlay remaining visible after a file was successfully added to the canvas.
 - Added capture-phase and next-frame safety cleanup so future canvas handlers cannot leave the overlay stuck.
