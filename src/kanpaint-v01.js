@@ -1,0 +1,1281 @@
+'use strict';
+
+/*
+ * KanPaint v0.1 extension layer.
+ * Upstream core remains in index.html. This file intentionally owns new
+ * features so later versions can be split into modules without growing the
+ * already-large upstream core.
+ */
+(() => {
+    const VERSION = '0.1.0';
+    const SCRIPT_LIBRARY_KEY = 'kanpaint.script-library.v1';
+    const SCRIPT_RECENT_KEY = 'kanpaint.script-recent.v1';
+    const SCRIPT_LIMIT = 50;
+    const SCRIPT_BYTES = 256 * 1024;
+    const SCRIPT_TOTAL_BYTES = 2 * 1024 * 1024;
+    const LIVE_PREVIEW_PIXELS = 1_200_000;
+
+    const kp = window.KanPaint = window.KanPaint || {};
+    kp.version = VERSION;
+    const RETOUCH_PROP = '_kanPaintRetouch';
+    if (Array.isArray(OS._fabricDocumentProperties) && !OS._fabricDocumentProperties.includes(RETOUCH_PROP)) OS._fabricDocumentProperties.push(RETOUCH_PROP);
+    if (window.fabric?.FabricObject && Array.isArray(fabric.FabricObject.customProperties) && !fabric.FabricObject.customProperties.includes(RETOUCH_PROP)) {
+        fabric.FabricObject.customProperties.push(RETOUCH_PROP);
+    }
+
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, Number(v) || 0));
+    const nextFrame = () => new Promise(resolve => requestAnimationFrame(() => resolve()));
+    const tick = () => new Promise(resolve => setTimeout(resolve, 0));
+    const textBytes = value => new Blob([String(value || '')]).size;
+    const safeName = (value, fallback = 'Layer') => {
+        const cleaned = String(value || '').trim().replace(/[\\/:*?"<>|\x00-\x1f]/g, '_').replace(/\s+/g, ' ').slice(0, 120);
+        return cleaned || fallback;
+    };
+    const el = (tag, attrs = {}, children = []) => {
+        const node = document.createElement(tag);
+        Object.entries(attrs).forEach(([key, value]) => {
+            if (key === 'class') node.className = value;
+            else if (key === 'text') node.textContent = value;
+            else if (key === 'type') node.type = value;
+            else if (key === 'checked') node.checked = Boolean(value);
+            else if (key === 'value') node.value = value;
+            else if (key === 'dataset') Object.entries(value || {}).forEach(([k, v]) => { node.dataset[k] = v; });
+            else if (key in node && !key.startsWith('aria')) node[key] = value;
+            else node.setAttribute(key, String(value));
+        });
+        (Array.isArray(children) ? children : [children]).filter(Boolean).forEach(child => node.append(child));
+        return node;
+    };
+    const button = (label, className = 'btn') => el('button', { type:'button', class:className, text:label });
+
+    function closeModal(overlay) {
+        if (!overlay) return;
+        overlay.remove();
+    }
+    function modal(title, { widthClass = '' } = {}) {
+        const overlay = el('div', { class:'kp-modal-overlay' });
+        const box = el('section', { class:`kp-modal ${widthClass}`.trim(), role:'dialog', 'aria-modal':'true' });
+        const heading = el('h3', { text:title });
+        box.append(heading);
+        overlay.append(box);
+        document.body.append(overlay);
+        overlay.addEventListener('mousedown', event => { if (event.target === overlay) closeModal(overlay); });
+        const esc = event => {
+            if (event.key !== 'Escape' || !overlay.isConnected) return;
+            closeModal(overlay);
+            document.removeEventListener('keydown', esc, true);
+        };
+        document.addEventListener('keydown', esc, true);
+        return { overlay, box, close:() => closeModal(overlay) };
+    }
+
+    // ---------------------------------------------------------------------
+    // Layer export: PNG, per layer, exact alpha trim, optional padding + ZIP.
+    // Uses the upstream rasterizer but scans only the candidate object bounds,
+    // avoiding a full-document RGBA allocation for every layer.
+    // ---------------------------------------------------------------------
+    const LayerExport = {
+        _scopeLayers(scope = 'visible') {
+            const layers = Array.isArray(OS.layers) ? OS.layers : [];
+            const selected = new Set(OS._selectedLayerIds || []);
+            if (!selected.size && layers[OS.activeLayerIdx]?.id) selected.add(layers[OS.activeLayerIdx].id);
+            return layers.map((layer, index) => ({ layer, index })).filter(({ layer }) => {
+                if (!layer || layer.kind === 'group') return false;
+                const objects = (layer.objects || []).filter(object => object?.name !== '__boundary__' && !object?.excludeFromExport);
+                if (!objects.length) return false;
+                if (scope === 'all') return true;
+                if (scope === 'selected') return selected.has(layer.id);
+                const group = typeof OS._getPSDGroupState === 'function' ? OS._getPSDGroupState(layer) : { visible:true };
+                return layer.visible !== false && group.visible !== false;
+            });
+        },
+        _alphaBounds(canvas) {
+            const ctx = canvas.getContext('2d', { willReadFrequently:true });
+            const width = canvas.width, height = canvas.height;
+            if (!ctx || !width || !height) return null;
+            const data = ctx.getImageData(0, 0, width, height).data;
+            let minX = width, minY = height, maxX = -1, maxY = -1;
+            for (let y = 0; y < height; y++) {
+                let row = (y * width) * 4 + 3;
+                for (let x = 0; x < width; x++, row += 4) {
+                    if (data[row] === 0) continue;
+                    if (x < minX) minX = x;
+                    if (y < minY) minY = y;
+                    if (x > maxX) maxX = x;
+                    if (y > maxY) maxY = y;
+                }
+            }
+            return maxX < minX ? null : { x:minX, y:minY, width:maxX-minX+1, height:maxY-minY+1 };
+        },
+        _renderOne(layer, { trim = true, padding = 0 } = {}) {
+            const report = { warnings:[] };
+            const rendered = OS._renderLayerCanvasForPSD(layer, report);
+            if (!rendered?.canvas) return null;
+            const groupState = typeof OS._getPSDGroupState === 'function' ? OS._getPSDGroupState(layer) : { opacity:1 };
+            const opacity = clamp((rendered.opacity ?? 1) * (groupState.opacity ?? 1), 0, 1);
+            if (opacity <= 0) return null;
+
+            if (!trim) {
+                const full = document.createElement('canvas');
+                full.width = Math.max(1, Math.round(OS.canvasW));
+                full.height = Math.max(1, Math.round(OS.canvasH));
+                const ctx = full.getContext('2d');
+                ctx.globalAlpha = opacity;
+                ctx.drawImage(rendered.canvas, 0, 0);
+                return full;
+            }
+
+            const rough = OS._oraLayerBounds(layer, rendered.canvas);
+            // Scan a small halo too, so antialiasing and shadows near an object
+            // bound are not clipped before the exact alpha pass.
+            const halo = 24;
+            const sx = Math.max(0, rough.x - halo);
+            const sy = Math.max(0, rough.y - halo);
+            const ex = Math.min(rendered.canvas.width, rough.x + rough.width + halo);
+            const ey = Math.min(rendered.canvas.height, rough.y + rough.height + halo);
+            const scan = document.createElement('canvas');
+            scan.width = Math.max(1, ex - sx);
+            scan.height = Math.max(1, ey - sy);
+            const scanCtx = scan.getContext('2d');
+            scanCtx.globalAlpha = opacity;
+            scanCtx.drawImage(rendered.canvas, -sx, -sy);
+            const exact = this._alphaBounds(scan);
+            if (!exact) return null;
+
+            const pad = Math.max(0, Math.min(512, Math.round(Number(padding) || 0)));
+            const out = document.createElement('canvas');
+            out.width = Math.max(1, exact.width + pad * 2);
+            out.height = Math.max(1, exact.height + pad * 2);
+            out.getContext('2d').drawImage(scan, -exact.x + pad, -exact.y + pad);
+            return out;
+        },
+        async export(options = {}) {
+            const scope = ['all','visible','selected'].includes(options.scope) ? options.scope : 'visible';
+            const trim = options.trim !== false;
+            const padding = Math.max(0, Math.min(512, Math.round(Number(options.padding) || 0)));
+            const zip = options.zip !== false;
+            const layers = this._scopeLayers(scope);
+            if (!layers.length) {
+                OS.toast('No drawable layers match the export scope', 'info');
+                return { exported:0, skipped:0 };
+            }
+            const used = new Set();
+            const entries = [];
+            let skipped = 0;
+            for (let i = 0; i < layers.length; i++) {
+                const { layer, index } = layers[i];
+                options.onProgress?.({ index:i + 1, total:layers.length, layer });
+                const canvas = this._renderOne(layer, { trim, padding });
+                if (!canvas) { skipped++; continue; }
+                let base = safeName(layer.name, `Layer_${index + 1}`);
+                let name = `${base}.png`, suffix = 2;
+                while (used.has(name.toLowerCase())) name = `${base}_${suffix++}.png`;
+                used.add(name.toLowerCase());
+                const bytes = OS._oraPNGBytesFromCanvas(canvas);
+                entries.push({ name, bytes });
+                if ((i + 1) % 3 === 0) await tick();
+            }
+            if (!entries.length) {
+                OS.toast('All matching layers were empty or fully transparent', 'info');
+                return { exported:0, skipped };
+            }
+            if (zip || entries.length > 1) {
+                const blob = await OS._zipBatchEntries(entries, {
+                    onProgress: detail => options.onZipProgress?.(detail)
+                });
+                OS._downloadBlob(blob, options.filename || 'KanPaint-Layers.zip');
+            } else {
+                OS._downloadBlob(new Blob([entries[0].bytes], { type:'image/png' }), entries[0].name);
+            }
+            OS.toast(`Exported ${entries.length} layer${entries.length === 1 ? '' : 's'}${skipped ? ` · skipped ${skipped} empty` : ''}`, 'success');
+            return { exported:entries.length, skipped, names:entries.map(entry => entry.name) };
+        },
+        showDialog() {
+            const ui = modal('Export Layers');
+            const intro = el('p', { text:'Export each rasterized layer as a transparent PNG. Auto Trim removes transparent canvas around the real pixels.' });
+            const scope = el('select');
+            [['visible','Visible layers'],['selected','Selected layers'],['all','All layers']].forEach(([value,label]) => scope.append(el('option',{value,text:label})));
+            const trim = el('input', { type:'checkbox', checked:true });
+            const zip = el('input', { type:'checkbox', checked:true });
+            const padding = el('input', { type:'number', value:'0', min:'0', max:'512', step:'1' });
+            const row = (label, control) => ui.box.append(el('div',{class:'kp-form-row'},[el('label',{text:label}),control]));
+            ui.box.append(intro); row('Scope', scope); row('Auto Trim transparent pixels', trim); row('Padding (px)', padding); row('Download as ZIP', zip);
+            const progress = el('div', { class:'kp-progress', text:'' });
+            const actions = el('div', { class:'kp-modal-actions' });
+            const cancel = button('Cancel');
+            const run = button('Export', 'btn btn-primary');
+            actions.append(cancel, run); ui.box.append(progress, actions);
+            cancel.addEventListener('click', ui.close);
+            run.addEventListener('click', async () => {
+                run.disabled = true; cancel.disabled = true;
+                try {
+                    await this.export({
+                        scope:scope.value,
+                        trim:trim.checked,
+                        padding:+padding.value || 0,
+                        zip:zip.checked,
+                        onProgress:({index,total,layer}) => { progress.textContent = `Rendering ${index}/${total}: ${safeName(layer.name)}`; },
+                        onZipProgress:({index,total}) => { progress.textContent = `Building ZIP ${index}/${total}…`; }
+                    });
+                    ui.close();
+                } catch (error) {
+                    console.error(error); progress.textContent = `Export failed: ${error.message}`; run.disabled = false; cancel.disabled = false;
+                    OS.toast(`Layer export failed: ${error.message}`, 'error');
+                }
+            });
+        }
+    };
+    kp.layers = LayerExport;
+
+    // ---------------------------------------------------------------------
+    // Sandboxed scripts + persistent script library.
+    // The sandbox has no same-origin permission, no network, and no direct DOM
+    // access. Only these explicit bridge methods can affect the document.
+    // ---------------------------------------------------------------------
+    const ScriptEngine = {
+        builtins: [
+            {
+                id:'builtin.export-visible-trim', name:'Export visible layers — Auto Trim', builtin:true,
+                description:'Exports visible layers as trimmed transparent PNG files inside one ZIP.',
+                source:`await kan.layers.export({ scope: 'visible', trim: true, padding: 0, zip: true });`
+            },
+            {
+                id:'builtin.export-selected-trim', name:'Export selected layers — Auto Trim', builtin:true,
+                description:'Exports the selected layer(s) only.',
+                source:`await kan.layers.export({ scope: 'selected', trim: true, padding: 0, zip: true });`
+            },
+            {
+                id:'builtin.layer-report', name:'Layer report', builtin:true,
+                description:'Shows the number of layers and their names in the browser console.',
+                source:`const layers = await kan.layers.list();\nconsole.log('KanPaint layers:', layers);\nawait kan.ui.toast('Layers: ' + layers.length, 'info');`
+            }
+        ],
+        _loadUser() {
+            try {
+                const parsed = JSON.parse(localStorage.getItem(SCRIPT_LIBRARY_KEY) || '[]');
+                if (!Array.isArray(parsed)) return [];
+                return parsed.filter(item => item && typeof item.name === 'string' && typeof item.source === 'string').slice(0, SCRIPT_LIMIT);
+            } catch (_) { return []; }
+        },
+        _saveUser(items) {
+            const list = items.slice(0, SCRIPT_LIMIT).map(item => ({
+                id:String(item.id || `user.${Date.now()}.${Math.random().toString(36).slice(2)}`),
+                name:safeName(item.name, 'Script'), description:String(item.description || '').slice(0, 240), source:String(item.source || '').slice(0, SCRIPT_BYTES)
+            }));
+            const json = JSON.stringify(list);
+            if (textBytes(json) > SCRIPT_TOTAL_BYTES) throw new Error('Script library exceeds the 2 MiB local limit');
+            localStorage.setItem(SCRIPT_LIBRARY_KEY, json);
+            return list;
+        },
+        list() { return [...this.builtins, ...this._loadUser()]; },
+        _bridge(method, args = {}) {
+            if (method === 'document.info') {
+                return {
+                    width:Math.round(OS.canvasW || 0), height:Math.round(OS.canvasH || 0),
+                    layerCount:OS.layers?.length || 0, activeLayerIndex:OS.activeLayerIdx
+                };
+            }
+            if (method === 'layers.list') {
+                return (OS.layers || []).map((layer,index) => ({
+                    id:layer.id, index, name:String(layer.name || `Layer ${index + 1}`), kind:layer.kind || 'pixel',
+                    visible:layer.visible !== false, locked:Boolean(layer.locked), opacity:Number(layer.opacity ?? 100)
+                }));
+            }
+            if (method === 'layers.export') return LayerExport.export(args || {});
+            if (method === 'layers.rename') {
+                const index = (OS.layers || []).findIndex(layer => layer.id === args.id);
+                if (index < 0) throw new Error('Layer not found');
+                const name = safeName(args.name, `Layer ${index + 1}`);
+                OS.layers[index].name = name; OS.updateLayersPanel?.(); OS.saveHistory?.('Rename Layer');
+                return { id:OS.layers[index].id, name };
+            }
+            if (method === 'layers.setVisible') {
+                const index = (OS.layers || []).findIndex(layer => layer.id === args.id);
+                if (index < 0) throw new Error('Layer not found');
+                OS.layers[index].visible = Boolean(args.visible); OS._applyLayerInteractionState?.(); OS.updateLayersPanel?.(); OS.canvas?.renderAll?.();
+                OS.saveHistory?.('Layer Visibility'); return true;
+            }
+            if (method === 'layers.active') {
+                const index=OS.activeLayerIdx, layer=(OS.layers||[])[index]; if(!layer)return null;
+                return { id:layer.id,index,name:String(layer.name||`Layer ${index+1}`),kind:layer.kind||'pixel',visible:layer.visible!==false,locked:Boolean(layer.locked),opacity:Number(layer.opacity??100) };
+            }
+            if (method === 'skin.info') return { params:{...Skin.params}, presets:Object.keys(Skin.presets), outputMode:Skin.outputMode, hasSession:Boolean(Skin.session), dirty:Boolean(Skin.session?.dirty), retouchLayers:Skin.listRetouchLayers() };
+            if (method === 'skin.preset') return Skin.applyPreset(String(args.name||'natural'));
+            if (method === 'skin.layers') return Skin.listRetouchLayers();
+            if (method === 'skin.editActive') return Skin.loadActiveRetouch(null,{silent:true});
+            if (method === 'skin.maskInfo') return { ...Skin.maskParams };
+            if (method === 'skin.invertMask') return Skin.invertMask();
+            if (method === 'selection.info') {
+                const b = OS._selectionBounds;
+                return { active:Boolean(OS._selectionMask || b), bounds:b ? { x:b.x, y:b.y, width:b.w, height:b.h } : null };
+            }
+            if (method === 'ui.toast') {
+                OS.toast(String(args.message || '').slice(0, 240), ['success','error','info'].includes(args.type) ? args.type : 'info');
+                return true;
+            }
+            throw new Error(`Script API method is not allowed: ${method}`);
+        },
+        _wrappedSource(source) {
+            return `const host = globalThis.__openShopPluginHost;\n` +
+`const pending = new Map(); let seq = 0;\n` +
+`window.addEventListener('message', event => { const d = event.data; if (!d || d.type !== 'kanpaint:script-response' || d.token !== host.token) return; const p = pending.get(d.requestId); if (!p) return; pending.delete(d.requestId); d.ok ? p.resolve(d.result) : p.reject(new Error(d.error || 'Script request failed')); });\n` +
+`const request = (method,args={}) => new Promise((resolve,reject)=>{ const requestId = 'kp-' + (++seq); pending.set(requestId,{resolve,reject}); window.parent.postMessage({type:'kanpaint:script-request',pluginId:host.pluginId,token:host.token,requestId,method,args},'*'); });\n` +
+`const kan = Object.freeze({\n` +
+`  version:'${VERSION}',\n` +
+`  document:Object.freeze({info:()=>request('document.info')}),\n` +
+`  layers:Object.freeze({list:()=>request('layers.list'),active:()=>request('layers.active'),export:(o={})=>request('layers.export',o),rename:(id,name)=>request('layers.rename',{id,name}),setVisible:(id,visible)=>request('layers.setVisible',{id,visible})}),\n` +
+`  skin:Object.freeze({info:()=>request('skin.info'),preset:(name)=>request('skin.preset',{name}),layers:()=>request('skin.layers'),editActive:()=>request('skin.editActive'),maskInfo:()=>request('skin.maskInfo'),invertMask:()=>request('skin.invertMask')}),\n` +
+`  selection:Object.freeze({info:()=>request('selection.info')}),\n` +
+`  ui:Object.freeze({toast:(message,type='info')=>request('ui.toast',{message,type})})\n` +
+`});\n` +
+`(async()=>{ try {\n${source}\n; window.parent.postMessage({type:'kanpaint:script-complete',pluginId:host.pluginId,token:host.token,ok:true},'*'); } catch(error) { window.parent.postMessage({type:'kanpaint:script-complete',pluginId:host.pluginId,token:host.token,ok:false,error:String(error?.message||error)},'*'); } })();`;
+        },
+        run(source, { name = 'Script' } = {}) {
+            const raw = String(source || '');
+            if (!raw.trim()) return Promise.reject(new Error('Script is empty'));
+            if (textBytes(raw) > SCRIPT_BYTES) return Promise.reject(new Error('Script exceeds the 256 KiB limit'));
+            const id = `kanpaint.script.${Date.now()}.${Math.random().toString(36).slice(2)}`;
+            const token = crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`;
+            const iframe = el('iframe', { title:`KanPaint script sandbox: ${safeName(name)}` });
+            iframe.setAttribute('sandbox','allow-scripts'); iframe.style.display = 'none'; iframe.src = './plugin-sandbox.html';
+            document.body.append(iframe);
+            return new Promise((resolve, reject) => {
+                let settled = false;
+                const cleanup = () => { window.removeEventListener('message', onMessage); clearTimeout(timeout); iframe.remove(); };
+                const finish = (ok, value) => { if (settled) return; settled = true; cleanup(); ok ? resolve(value) : reject(value instanceof Error ? value : new Error(String(value))); };
+                const onMessage = event => {
+                    if (event.source !== iframe.contentWindow) return;
+                    const data = event.data || {};
+                    if (data.pluginId !== id || data.token !== token) return;
+                    if (data.type === 'kanpaint:script-request') {
+                        Promise.resolve().then(() => this._bridge(String(data.method || ''), data.args || {})).then(
+                            result => iframe.contentWindow?.postMessage({ type:'kanpaint:script-response', token, requestId:data.requestId, ok:true, result }, '*'),
+                            error => iframe.contentWindow?.postMessage({ type:'kanpaint:script-response', token, requestId:data.requestId, ok:false, error:String(error?.message || error) }, '*')
+                        );
+                        return;
+                    }
+                    if (data.type === 'kanpaint:script-complete') {
+                        if (data.ok) { try{localStorage.setItem(SCRIPT_RECENT_KEY,JSON.stringify({name:safeName(name),source:raw,ranAt:Date.now()}));}catch(_){} OS.toast(`Script finished: ${safeName(name)}`, 'success'); finish(true, true); }
+                        else { OS.toast(`Script failed: ${data.error || 'Unknown error'}`, 'error'); finish(false, new Error(data.error || 'Script failed')); }
+                    }
+                };
+                window.addEventListener('message', onMessage);
+                const timeout = setTimeout(() => finish(false, new Error('Script timed out after 60 seconds')), 60000);
+                iframe.addEventListener('load', () => {
+                    iframe.contentWindow?.postMessage({
+                        type:'openshop:host-init', protocolVersion:1, pluginId:id, token,
+                        source:this._wrappedSource(raw), capabilities:[], api:{ version:1 },
+                        manifest:{ id, version:'1.0.0', name:safeName(name), minApiVersion:1 }
+                    }, '*');
+                }, { once:true });
+            });
+        },
+        runRecent() {
+            try {
+                const recent=JSON.parse(localStorage.getItem(SCRIPT_RECENT_KEY)||'null');
+                if(!recent?.source) { OS.toast('No recently run script yet','info'); return Promise.resolve(false); }
+                return this.run(recent.source,{name:recent.name||'Recent Script'});
+            } catch(error) { OS.toast('Could not read recent script','error'); return Promise.reject(error); }
+        },
+        runFile() {
+            const input = el('input', { type:'file', accept:'.js,.kan.js,text/javascript,application/javascript' });
+            input.addEventListener('change', async () => {
+                const file = input.files?.[0]; if (!file) return;
+                if (file.size > SCRIPT_BYTES) { OS.toast('Script is larger than 256 KiB', 'error'); return; }
+                try { await this.run(await file.text(), { name:file.name }); }
+                catch (error) { console.error(error); }
+            });
+            input.click();
+        },
+        exportLibrary() {
+            const payload = JSON.stringify({ format:'kanpaint-script-library', version:1, exportedAt:new Date().toISOString(), scripts:this._loadUser() }, null, 2);
+            OS._downloadBlob(new Blob([payload], { type:'application/json' }), 'KanPaint-Script-Library.kanlib.json');
+            OS.toast('Script Library backup exported', 'success');
+        },
+        importLibrary(onImported) {
+            const input = el('input', { type:'file', accept:'.json,.kanlib,.kanlib.json,application/json' });
+            input.addEventListener('change', async () => {
+                const file=input.files?.[0]; if(!file)return;
+                try {
+                    if(file.size > SCRIPT_TOTAL_BYTES * 2) throw new Error('Library backup is too large');
+                    const parsed=JSON.parse(await file.text());
+                    const incoming=Array.isArray(parsed) ? parsed : parsed?.scripts;
+                    if(!Array.isArray(incoming)) throw new Error('Not a KanPaint Script Library backup');
+                    const current=this._loadUser();
+                    const merged=[...current];
+                    for(const item of incoming){
+                        if(!item || typeof item.source!=='string')continue;
+                        if(textBytes(item.source)>SCRIPT_BYTES)continue;
+                        const clean={ id:`user.${Date.now()}.${Math.random().toString(36).slice(2)}`, name:safeName(item.name,'Imported Script'), description:String(item.description||'Imported from library backup').slice(0,240), source:item.source };
+                        merged.push(clean);
+                        if(merged.length>=SCRIPT_LIMIT)break;
+                    }
+                    this._saveUser(merged); OS.toast('Script Library backup imported', 'success'); onImported?.();
+                } catch(error){ OS.toast(`Could not import Script Library: ${error.message}`, 'error'); }
+            });
+            input.click();
+        },
+        showLibrary() {
+            const ui = modal('Script Library');
+            ui.box.append(el('p',{text:'Built-in scripts are read-only. Imported or created scripts are stored locally in this browser for quick reuse. Scripts run in an isolated sandbox with a small allow-listed KanPaint API.'}));
+            const search = el('input',{type:'search',class:'kp-script-search',placeholder:'Search scripts…','aria-label':'Search scripts'});
+            const listRoot = el('div',{class:'kp-script-list'});
+            const footer = el('div',{class:'kp-modal-actions'});
+            const importBtn = button('Import .js'); const newBtn = button('New Script'); const backupBtn = button('Backup Library'); const restoreBtn = button('Restore Library'); const closeBtn = button('Close');
+            footer.append(importBtn,newBtn,backupBtn,restoreBtn,closeBtn); ui.box.append(search,listRoot,footer);
+            const render = () => {
+                listRoot.replaceChildren();
+                const q=search.value.trim().toLowerCase();
+                this.list().filter(item=>!q || `${item.name} ${item.description||''}`.toLowerCase().includes(q)).forEach(item => {
+                    const meta = el('div');
+                    const title = el('strong',{text:item.name}); if (item.builtin) title.append(el('span',{class:'kp-badge',text:'Built-in'}));
+                    meta.append(title, el('small',{text:item.description || (item.builtin ? 'KanPaint built-in script' : 'Saved locally')}));
+                    const actions = el('div',{class:'kp-script-actions'});
+                    const run = button('Run'); actions.append(run);
+                    run.addEventListener('click', async () => { run.disabled = true; try { await this.run(item.source,{name:item.name}); } catch(e){ console.error(e); } finally { run.disabled=false; } });
+                    if (item.builtin) {
+                        const copy = button('Copy to Library'); actions.append(copy);
+                        copy.addEventListener('click', () => {
+                            const users=this._loadUser(); users.push({id:`user.${Date.now()}`,name:`${item.name} Copy`,description:item.description,source:item.source});
+                            try { this._saveUser(users); render(); } catch(e){ OS.toast(e.message,'error'); }
+                        });
+                    } else {
+                        const edit = button('Edit'); const del = button('Delete','btn btn-danger'); actions.append(edit,del);
+                        edit.addEventListener('click',()=>this._showEditor(item, render));
+                        del.addEventListener('click',()=>{ const users=this._loadUser().filter(x=>x.id!==item.id); this._saveUser(users); render(); });
+                    }
+                    listRoot.append(el('div',{class:'kp-script-row'},[meta,actions]));
+                });
+            };
+            importBtn.addEventListener('click',()=>{
+                const input=el('input',{type:'file',accept:'.js,.kan.js,text/javascript,application/javascript'});
+                input.addEventListener('change',async()=>{ const file=input.files?.[0]; if(!file)return; if(file.size>SCRIPT_BYTES){OS.toast('Script is larger than 256 KiB','error');return;} const users=this._loadUser(); users.push({id:`user.${Date.now()}`,name:file.name.replace(/\.kan\.js$|\.js$/i,''),description:`Imported from ${file.name}`,source:await file.text()}); try{this._saveUser(users);render();}catch(e){OS.toast(e.message,'error');} }); input.click();
+            });
+            search.addEventListener('input',render); newBtn.addEventListener('click',()=>this._showEditor(null,render)); backupBtn.addEventListener('click',()=>this.exportLibrary()); restoreBtn.addEventListener('click',()=>this.importLibrary(render)); closeBtn.addEventListener('click',ui.close); render();
+        },
+        _showEditor(item, onSaved) {
+            const ui=modal(item ? 'Edit Script' : 'New Script');
+            const wrap=el('div',{class:'kp-script-editor'});
+            const name=el('input',{type:'text',value:item?.name || 'My Script',maxlength:100});
+            const source=el('textarea',{value:item?.source || `// KanPaint Script API example\nconst layers = await kan.layers.list();\nawait kan.ui.toast('Layers: ' + layers.length);`});
+            wrap.append(el('label',{text:'Name'}),name,el('label',{text:'JavaScript'}),source);
+            const actions=el('div',{class:'kp-modal-actions'}); const cancel=button('Cancel'); const runNow=button('Run'); const save=button('Save','btn btn-primary'); actions.append(cancel,runNow,save); ui.box.append(wrap,actions);
+            cancel.addEventListener('click',ui.close); runNow.addEventListener('click',async()=>{runNow.disabled=true;try{await this.run(source.value,{name:name.value||'Unsaved Script'});}catch(e){console.error(e);}finally{runNow.disabled=false;}}); save.addEventListener('click',()=>{ try{ if(textBytes(source.value)>SCRIPT_BYTES) throw new Error('Script is larger than 256 KiB'); const users=this._loadUser(); const record={id:item?.id || `user.${Date.now()}.${Math.random().toString(36).slice(2)}`,name:safeName(name.value,'My Script'),description:item?.description || 'Saved locally',source:source.value}; const index=users.findIndex(x=>x.id===record.id); if(index>=0)users[index]=record; else users.push(record); this._saveUser(users); ui.close(); onSaved?.(); }catch(e){OS.toast(e.message,'error');} });
+        }
+    };
+    kp.scripts = ScriptEngine;
+
+    // ---------------------------------------------------------------------
+    // Skin Retouch: selection-aware brush mask + non-destructive preview.
+    // Sliders preview only on "change" (release), not on every mousemove.
+    // Large images use a <=1.2 MP preview proxy; Apply renders full resolution
+    // once and records one history state.
+    // ---------------------------------------------------------------------
+    const Skin = {
+        params:{ size:70, hardness:35, flow:45, amount:65, smooth:35, light:0, shadows:18, shine:10, tone:12, warmth:0, texture:14, grainSize:1, preserve:72 },
+        presets:{
+            natural:{ amount:65,smooth:35,light:0,shadows:18,shine:10,tone:12,warmth:0,texture:14,grainSize:1,preserve:72 },
+            soft:{ amount:58,smooth:52,light:2,shadows:20,shine:16,tone:18,warmth:2,texture:8,grainSize:1,preserve:82 },
+            shadow:{ amount:72,smooth:22,light:2,shadows:48,shine:8,tone:10,warmth:1,texture:12,grainSize:1,preserve:78 },
+            texture:{ amount:62,smooth:18,light:0,shadows:10,shine:8,tone:8,warmth:0,texture:38,grainSize:1.2,preserve:90 }
+        },
+        session:null, painting:false, _previewTicket:0, _scheduled:false,
+        _selectionMask() { return OS._selectionMask || (OS._selectionBounds ? OS._maskFromMarqueeBounds?.() : null); },
+        _setStatus(message='') { const node=document.getElementById('kp-skin-status'); if(node) node.textContent=message; },
+        _syncControls() {
+            document.querySelectorAll('[data-kp-skin-param]').forEach(input => {
+                const key=input.dataset.kpSkinParam; if(!(key in this.params)) return;
+                input.value=String(this.params[key]);
+                const out=input.parentElement?.querySelector('output'); if(out) out.textContent=`${this.params[key]}${input.dataset.suffix||''}`;
+            });
+        },
+        applyPreset(name) {
+            const preset=this.presets[name]; if(!preset) throw new Error('Unknown Skin Retouch preset');
+            Object.assign(this.params,preset); this._syncControls(); this._setStatus(`Preset: ${name}`);
+            if(this.session?.dirty) void this.preview(); return { ...this.params };
+        },
+        _findTarget(ptr) {
+            let target=OS.canvas?.getActiveObject?.();
+            if (!target || target.type !== 'image') {
+                const objs=(OS.canvas?.getObjects?.() || []).filter(o=>o.type==='image' && o.containsPoint?.(ptr)); target=objs.at(-1) || null;
+            }
+            return target?.type === 'image' ? target : null;
+        },
+        _sourceCanvas(target) {
+            const image=target.getElement?.(); if(!image)return null;
+            const canvas=document.createElement('canvas'); canvas.width=image.naturalWidth||image.width||target.width||1; canvas.height=image.naturalHeight||image.height||target.height||1;
+            canvas.getContext('2d',{willReadFrequently:true}).drawImage(image,0,0,canvas.width,canvas.height); return canvas;
+        },
+        _startSession(target) {
+            if (this.session?.target === target) return this.session;
+            if (this.session) this.cancel({ silent:true });
+            const source=this._sourceCanvas(target); if(!source) throw new Error('Could not read image pixels');
+            this.session={ target, source, mask:new Uint8Array(source.width*source.height), dirty:false, bounds:null,
+                guard:{ generation:OS._documentGeneration, revision:OS._documentRevision, targetId:OS._ensureObjectId?.(target) } };
+            this._updatePanelState(); return this.session;
+        },
+        _displayToSource(target, ptr, source) {
+            const matrix=target.calcTransformMatrix(); const inv=fabric.util.invertTransform(matrix); const local=fabric.util.transformPoint(ptr,inv);
+            const currentW=Math.max(1,Number(target.width)||target.getElement?.()?.width||source.width); const currentH=Math.max(1,Number(target.height)||target.getElement?.()?.height||source.height);
+            return { x:(local.x+currentW/2)*source.width/currentW, y:(local.y+currentH/2)*source.height/currentH, matrix, currentW, currentH };
+        },
+        _paint(ptr) {
+            const s=this.session; if(!s)return;
+            const mapped=this._displayToSource(s.target,ptr,s.source); const source=s.source;
+            const m=mapped.matrix; const displayScaleX=Math.max(.001,Math.hypot(m[0]||1,m[1]||0)*mapped.currentW/source.width); const displayScaleY=Math.max(.001,Math.hypot(m[2]||0,m[3]||1)*mapped.currentH/source.height);
+            const radiusDoc=Math.max(1,this.params.size/2); const rx=Math.ceil(radiusDoc/displayScaleX), ry=Math.ceil(radiusDoc/displayScaleY);
+            const x0=Math.max(0,Math.floor(mapped.x-rx)), y0=Math.max(0,Math.floor(mapped.y-ry)), x1=Math.min(source.width,Math.ceil(mapped.x+rx)), y1=Math.min(source.height,Math.ceil(mapped.y+ry));
+            const selection=this._selectionMask(); const docW=Math.max(1,Math.round(OS.canvasW||1)),docH=Math.max(1,Math.round(OS.canvasH||1)); const hard=clamp(this.params.hardness,0,100)/100; const flow=clamp(this.params.flow,1,100)/100;
+            let bx0=source.width,by0=source.height,bx1=-1,by1=-1;
+            for(let y=y0;y<y1;y++) for(let x=x0;x<x1;x++){
+                const dx=(x+.5-mapped.x)*displayScaleX,dy=(y+.5-mapped.y)*displayScaleY,d=Math.sqrt(dx*dx+dy*dy)/radiusDoc; if(d>=1)continue;
+                let edge=d<=hard?1:(1-(d-hard)/Math.max(.001,1-hard)); edge=clamp(edge,0,1); if(edge<=0)continue;
+                const localX=(x+.5)/source.width*mapped.currentW-mapped.currentW/2, localY=(y+.5)/source.height*mapped.currentH-mapped.currentH/2;
+                const doc=fabric.util.transformPoint({x:localX,y:localY},m); const sel=selection?OS._selectionCoverageAt(selection,Math.floor(doc.x),Math.floor(doc.y),docW,docH)/255:1; if(sel<=0)continue;
+                const add=edge*flow*sel; const idx=y*source.width+x; const old=s.mask[idx]/255; const next=old+(1-old)*add; s.mask[idx]=Math.max(s.mask[idx],Math.round(next*255));
+                bx0=Math.min(bx0,x);by0=Math.min(by0,y);bx1=Math.max(bx1,x);by1=Math.max(by1,y);
+            }
+            if(bx1>=bx0){ const b=s.bounds; s.bounds=b?{x:Math.min(b.x,bx0),y:Math.min(b.y,by0),x2:Math.max(b.x2,bx1),y2:Math.max(b.y2,by1)}:{x:bx0,y:by0,x2:bx1,y2:by1}; s.dirty=true; }
+        },
+        _hashNoise(x,y){
+            const grain=Math.max(.5,Number(this.params.grainSize)||1);
+            const gx=Math.floor(x/grain), gy=Math.floor(y/grain);
+            let n=(gx*374761393+gy*668265263)>>>0; n=(n^(n>>>13))*1274126177>>>0; return ((n^(n>>>16))&1023)/511.5-1;
+        },
+        _render(scale=1) {
+            const s=this.session; if(!s)return null; const sw=s.source.width,sh=s.source.height; const w=Math.max(1,Math.round(sw*scale)),h=Math.max(1,Math.round(sh*scale));
+            const base=document.createElement('canvas');base.width=w;base.height=h;const bctx=base.getContext('2d',{willReadFrequently:true});bctx.drawImage(s.source,0,0,w,h);
+            if(!s.dirty)return base;
+            const blur=document.createElement('canvas');blur.width=w;blur.height=h;const blctx=blur.getContext('2d',{willReadFrequently:true}); const blurRadius=Math.max(.35,(0.6+this.params.smooth/22)*scale); blctx.filter=`blur(${blurRadius}px)`;blctx.drawImage(base,0,0);blctx.filter='none';
+            const src=bctx.getImageData(0,0,w,h), blurred=blctx.getImageData(0,0,w,h); const d=src.data,bd=blurred.data;
+            const amount=clamp(this.params.amount,0,100)/100, smooth=clamp(this.params.smooth,0,100)/100*amount, light=clamp(this.params.light,-50,50)/50*amount, shadows=clamp(this.params.shadows,0,100)/100*amount, shine=clamp(this.params.shine,0,100)/100*amount, tone=clamp(this.params.tone,0,100)/100*amount, warmth=clamp(this.params.warmth,-50,50)/50*amount, texture=clamp(this.params.texture,0,100)/100*amount, preserve=clamp(this.params.preserve,0,100)/100;
+            for(let y=0;y<h;y++) for(let x=0;x<w;x++){
+                const sx=Math.min(sw-1,Math.floor(x/scale)),sy=Math.min(sh-1,Math.floor(y/scale)); const mask=this._maskCoverageAt(s,sx,sy)/255; if(mask<=0)continue; const blend=mask*amount; const i=(y*w+x)*4;
+                const or=d[i],og=d[i+1],ob=d[i+2],br=bd[i],bg=bd[i+1],bb=bd[i+2]; const luma=(or*.2126+og*.7152+ob*.0722)/255, blurL=(br*.2126+bg*.7152+bb*.0722)/255;
+                const edge=Math.min(1,Math.abs(luma-blurL)*5); const smoothMix=smooth*(1-edge*(.45+.5*preserve)); let r=or+(br-or)*smoothMix,g=og+(bg-og)*smoothMix,b=ob+(bb-ob)*smoothMix;
+                const lightDelta=light*30; r+=lightDelta;g+=lightDelta;b+=lightDelta;
+                const shadowWeight=Math.pow(Math.max(0,.62-luma)/.62,1.4); const shadowLift=shadows*shadowWeight*48; r+=shadowLift;g+=shadowLift;b+=shadowLift;
+                const shineWeight=Math.pow(Math.max(0,luma-.68)/.32,1.5); const shineDrop=shine*shineWeight*44; r-=shineDrop;g-=shineDrop;b-=shineDrop;
+                const avg=(r+g+b)/3, blurAvg=(br+bg+bb)/3, toneMix=tone*(1-edge*.55)*.38;
+                r+=((br-blurAvg)-(r-avg))*toneMix; g+=((bg-blurAvg)-(g-avg))*toneMix; b+=((bb-blurAvg)-(b-avg))*toneMix;
+                const warmShift=warmth*14; r+=warmShift; g+=warmShift*.22; b-=warmShift*.8;
+                const detailR=or-br,detailG=og-bg,detailB=ob-bb; const detailRestore=smooth*preserve*.32+texture*.78; r+=detailR*detailRestore;g+=detailG*detailRestore;b+=detailB*detailRestore;
+                const grain=this._hashNoise(sx,sy)*texture*3.2; r+=grain;g+=grain;b+=grain;
+                d[i]=clamp(or+(r-or)*mask,0,255);d[i+1]=clamp(og+(g-og)*mask,0,255);d[i+2]=clamp(ob+(b-ob)*mask,0,255);
+            }
+            bctx.putImageData(src,0,0);return base;
+        },
+        async preview() {
+            const s=this.session;if(!s||!s.dirty)return; const ticket=++this._previewTicket; const pixels=s.source.width*s.source.height; const scale=pixels>LIVE_PREVIEW_PIXELS?Math.sqrt(LIVE_PREVIEW_PIXELS/pixels):1;
+            this._setStatus(scale<1?'Rendering fast preview…':'Rendering preview…');
+            await nextFrame(); if(ticket!==this._previewTicket||!this.session)return; const preview=this._render(scale); if(ticket!==this._previewTicket||!preview)return; OS._swapImageElement(s.target,preview); this._updatePanelState(); this._setStatus(scale<1?'Preview ready · full quality on Apply':'Preview ready');
+        },
+        schedulePreview(){ if(this._scheduled)return; this._scheduled=true; requestAnimationFrame(()=>{this._scheduled=false;void this.preview();}); },
+        async fillSelection(){
+            const selection=this._selectionMask(); if(!selection){OS.toast('Create a skin selection first','info');return false;}
+            let target=this.session?.target || OS.canvas?.getActiveObject?.(); if(!target||target.type!=='image'){OS.toast('Select an image layer first','info');return false;}
+            if(!OS._guardObjectEdit?.(target))return false;
+            const s=this._startSession(target), source=s.source, m=target.calcTransformMatrix();
+            const currentW=Math.max(1,Number(target.width)||target.getElement?.()?.width||source.width), currentH=Math.max(1,Number(target.height)||target.getElement?.()?.height||source.height);
+            const docW=Math.max(1,Math.round(OS.canvasW||1)),docH=Math.max(1,Math.round(OS.canvasH||1)); let bx0=source.width,by0=source.height,bx1=-1,by1=-1;
+            this._setStatus('Building mask from selection…');
+            for(let y=0;y<source.height;y++){
+                const localY=(y+.5)/source.height*currentH-currentH/2;
+                for(let x=0;x<source.width;x++){
+                    const localX=(x+.5)/source.width*currentW-currentW/2, doc=fabric.util.transformPoint({x:localX,y:localY},m);
+                    const coverage=OS._selectionCoverageAt(selection,Math.floor(doc.x),Math.floor(doc.y),docW,docH);
+                    const idx=y*source.width+x; s.mask[idx]=coverage;
+                    if(coverage>0){bx0=Math.min(bx0,x);by0=Math.min(by0,y);bx1=Math.max(bx1,x);by1=Math.max(by1,y);}
+                }
+                if(y%48===0) await tick();
+            }
+            s.dirty=bx1>=bx0; s.bounds=s.dirty?{x:bx0,y:by0,x2:bx1,y2:by1}:null; this._updatePanelState();
+            if(s.dirty) await this.preview(); else this._setStatus('Selection does not overlap the selected image');
+            return s.dirty;
+        },
+        clearMask(){
+            const s=this.session;if(!s)return false; s.mask.fill(0);s.dirty=false;s.bounds=null;this._previewTicket++;
+            try{OS._swapImageElement(s.target,s.source);}catch(_){} this._updatePanelState();this._setStatus('Retouch mask cleared');return true;
+        },
+        onDown(opt){ const ptr=OS.canvas.getScenePoint(opt.e); const target=this._findTarget(ptr); if(!target){OS.toast('Select or click an image before Skin Retouch','info');return;} if(!OS._guardObjectEdit?.(target))return; try{this._startSession(target);this.painting=true;this._paint(ptr);}catch(e){OS.toast(`Skin Retouch: ${e.message}`,'error');} },
+        onMove(opt){ if(!this.painting||!(opt.e.buttons&1))return; this._paint(OS.canvas.getScenePoint(opt.e)); },
+        onUp(){ if(!this.painting)return;this.painting=false;this.schedulePreview(); },
+        async apply({silent=false}={}){
+            const s=this.session;if(!s)return false; this._previewTicket++; if(!s.dirty){this.session=null;this._updatePanelState();return false;} OS._swapImageElement(s.target,s.source); await tick(); const full=this._render(1); if(!full)return false; const ok=await OS._replaceActiveImage(s.target,full.toDataURL('image/png'),'Skin Retouch',s.guard); this.session=null;this._updatePanelState(); if(ok&&!silent)OS.toast('Skin Retouch applied','success');return Boolean(ok);
+        },
+        cancel({silent=false}={}){ const s=this.session;if(!s)return false;this._previewTicket++;try{OS._swapImageElement(s.target,s.source);}catch(_){}this.session=null;this.painting=false;this._updatePanelState();if(!silent)OS.toast('Skin Retouch preview cancelled','info');return true; },
+        before(show){ const s=this.session;if(!s)return;if(show)OS._swapImageElement(s.target,s.source);else void this.preview(); },
+        _updatePanelState(){ const state=document.querySelector('#kp-skin-panel .kp-selection-state');if(state){const selected=Boolean(OS._selectionMask||OS._selectionBounds);state.textContent=`Selection: ${selected?'active — brush is clipped to selection':'none — brush can affect the whole image'}`;} const apply=document.getElementById('kp-skin-apply');if(apply)apply.disabled=!this.session?.dirty;const cancel=document.getElementById('kp-skin-cancel');if(cancel)cancel.disabled=!this.session; }
+    };
+    kp.skin = Skin;
+
+    // ---------------------------------------------------------------------
+    // KanPaint v0.1 non-destructive Skin Retouch layers.
+    // ---------------------------------------------------------------------
+    Skin.outputMode = 'layer';
+    Skin.maskParams = { feather:0, density:100, overlay:true };
+    Skin._maskOverlayObject = null;
+    Skin._eraseMode = false;
+
+    Skin._invalidateMaskCache = function() {
+        const s=this.session;if(!s)return;
+        s._maskRevision=(s._maskRevision||0)+1;s._effectiveMask=null;s._effectiveMaskKey='';
+    };
+
+    Skin._effectiveMask = function(s=this.session) {
+        if(!s)return null;
+        const density=clamp(this.maskParams.density,0,100)/100;
+        const radius=Math.max(0,Math.min(60,Math.round(Number(this.maskParams.feather)||0)));
+        const key=`${s._maskRevision||0}:${density}:${radius}`;
+        if(s._effectiveMask&&s._effectiveMaskKey===key)return s._effectiveMask;
+        const w=s.source.width,h=s.source.height,raw=s.mask;
+        if(radius===0){
+            const out=new Uint8Array(raw.length);
+            for(let i=0;i<raw.length;i++)out[i]=Math.round(raw[i]*density);
+            s._effectiveMask=out;s._effectiveMaskKey=key;return out;
+        }
+        const temp=new Float32Array(raw.length),out=new Uint8Array(raw.length),span=radius*2+1;
+        for(let y=0;y<h;y++){
+            let sum=0;const row=y*w;
+            for(let x=-radius;x<=radius;x++){const xx=Math.max(0,Math.min(w-1,x));sum+=raw[row+xx];}
+            for(let x=0;x<w;x++){
+                temp[row+x]=sum/span;
+                const drop=Math.max(0,Math.min(w-1,x-radius)),add=Math.max(0,Math.min(w-1,x+radius+1));
+                sum+=raw[row+add]-raw[row+drop];
+            }
+        }
+        for(let x=0;x<w;x++){
+            let sum=0;
+            for(let y=-radius;y<=radius;y++){const yy=Math.max(0,Math.min(h-1,y));sum+=temp[yy*w+x];}
+            for(let y=0;y<h;y++){
+                out[y*w+x]=Math.round(clamp(sum/span*density,0,255));
+                const drop=Math.max(0,Math.min(h-1,y-radius)),add=Math.max(0,Math.min(h-1,y+radius+1));
+                sum+=temp[add*w+x]-temp[drop*w+x];
+            }
+        }
+        s._effectiveMask=out;s._effectiveMaskKey=key;return out;
+    };
+
+    Skin._maskCoverageAt = function(s,x,y) {
+        const mask=this._effectiveMask(s);if(!mask)return 0;
+        const ix=Math.max(0,Math.min(s.source.width-1,Math.round(x))),iy=Math.max(0,Math.min(s.source.height-1,Math.round(y)));
+        return mask[iy*s.source.width+ix]||0;
+    };
+
+    Skin._syncMaskControls = function() {
+        document.querySelectorAll('[data-kp-mask-param]').forEach(input=>{
+            const key=input.dataset.kpMaskParam;if(!(key in this.maskParams))return;
+            if(input.type==='checkbox')input.checked=Boolean(this.maskParams[key]);else input.value=String(this.maskParams[key]);
+            const out=input.parentElement?.querySelector('output');if(out)out.textContent=`${this.maskParams[key]}${input.dataset.suffix||''}`;
+        });
+    };
+
+    Skin._removeMaskOverlay = function() {
+        const object=this._maskOverlayObject;if(object&&OS.canvas){try{OS.canvas.remove(object);}catch(_){}}
+        this._maskOverlayObject=null;OS.canvas?.requestRenderAll?.();
+    };
+
+    Skin._refreshMaskOverlay = async function() {
+        this._removeMaskOverlay();
+        const s=this.session;if(!s?.dirty||!this.maskParams.overlay||!OS.canvas)return;
+        const effective=this._effectiveMask(s);if(!effective)return;
+        const maxPixels=900000,pixels=s.source.width*s.source.height,scale=pixels>maxPixels?Math.sqrt(maxPixels/pixels):1;
+        const w=Math.max(1,Math.round(s.source.width*scale)),h=Math.max(1,Math.round(s.source.height*scale));
+        const canvas=document.createElement('canvas');canvas.width=w;canvas.height=h;
+        const ctx=canvas.getContext('2d'),image=ctx.createImageData(w,h);
+        for(let y=0;y<h;y++)for(let x=0;x<w;x++){
+            const sx=Math.min(s.source.width-1,Math.floor(x/scale)),sy=Math.min(s.source.height-1,Math.floor(y/scale)),a=effective[sy*s.source.width+sx];
+            const p=(y*w+x)*4;image.data[p]=255;image.data[p+1]=32;image.data[p+2]=32;image.data[p+3]=Math.round(a*.42);
+        }
+        ctx.putImageData(image,0,0);
+        const overlay=await fabric.FabricImage.fromURL(canvas.toDataURL('image/png'));
+        if(this.session!==s||!this.maskParams.overlay)return;
+        const target=s.target,targetW=Math.max(1,Number(target.width)||s.source.width),targetH=Math.max(1,Number(target.height)||s.source.height);
+        overlay.set({left:target.left,top:target.top,scaleX:(Number(target.scaleX)||1)*(targetW/w),scaleY:(Number(target.scaleY)||1)*(targetH/h),
+            angle:target.angle,flipX:target.flipX,flipY:target.flipY,skewX:target.skewX,skewY:target.skewY,originX:target.originX,originY:target.originY,
+            selectable:false,evented:false,excludeFromExport:true,name:'__kp_skin_mask_overlay__'});
+        this._maskOverlayObject=overlay;OS.canvas.add(overlay);OS.canvas.bringObjectToFront?.(overlay);OS.canvas.requestRenderAll?.();
+    };
+
+    Skin.setMaskParam = function(key,value) {
+        if(key==='overlay'){this.maskParams.overlay=Boolean(value);this._syncMaskControls();return this.maskParams.overlay?this._refreshMaskOverlay():this._removeMaskOverlay();}
+        if(key==='density')this.maskParams.density=clamp(value,0,100);
+        else if(key==='feather')this.maskParams.feather=clamp(value,0,60);
+        else throw new Error('Unknown mask parameter');
+        this._invalidateMaskCache();this._syncMaskControls();
+        if(this.session?.dirty){void this.preview();void this._refreshMaskOverlay();}
+        return {...this.maskParams};
+    };
+
+    Skin.invertMask = function() {
+        const s=this.session;if(!s){OS.toast('Start Skin Retouch before inverting the mask','info');return false;}
+        for(let i=0;i<s.mask.length;i++)s.mask[i]=255-s.mask[i];
+        s.dirty=s.mask.some(value=>value>0);s.bounds=s.dirty?{x:0,y:0,x2:s.source.width-1,y2:s.source.height-1}:null;
+        this._invalidateMaskCache();this._setStatus('Mask inverted');void this.preview();void this._refreshMaskOverlay();this._updatePanelState();return true;
+    };
+
+    Skin._paintV05 = function(ptr,erase=false) {
+        const s=this.session;if(!s)return;
+        const mapped=this._displayToSource(s.target,ptr,s.source),source=s.source,m=mapped.matrix;
+        const displayScaleX=Math.max(.001,Math.hypot(m[0]||1,m[1]||0)*mapped.currentW/source.width),displayScaleY=Math.max(.001,Math.hypot(m[2]||0,m[3]||1)*mapped.currentH/source.height);
+        const radiusDoc=Math.max(1,this.params.size/2),rx=Math.ceil(radiusDoc/displayScaleX),ry=Math.ceil(radiusDoc/displayScaleY);
+        const x0=Math.max(0,Math.floor(mapped.x-rx)),y0=Math.max(0,Math.floor(mapped.y-ry)),x1=Math.min(source.width,Math.ceil(mapped.x+rx)),y1=Math.min(source.height,Math.ceil(mapped.y+ry));
+        const selection=this._selectionMask(),docW=Math.max(1,Math.round(OS.canvasW||1)),docH=Math.max(1,Math.round(OS.canvasH||1)),hard=clamp(this.params.hardness,0,100)/100,flow=clamp(this.params.flow,1,100)/100;
+        let bx0=source.width,by0=source.height,bx1=-1,by1=-1;
+        for(let y=y0;y<y1;y++)for(let x=x0;x<x1;x++){
+            const dx=(x+.5-mapped.x)*displayScaleX,dy=(y+.5-mapped.y)*displayScaleY,d=Math.sqrt(dx*dx+dy*dy)/radiusDoc;if(d>=1)continue;
+            let edge=d<=hard?1:(1-(d-hard)/Math.max(.001,1-hard));edge=clamp(edge,0,1);if(edge<=0)continue;
+            const localX=(x+.5)/source.width*mapped.currentW-mapped.currentW/2,localY=(y+.5)/source.height*mapped.currentH-mapped.currentH/2;
+            const doc=fabric.util.transformPoint({x:localX,y:localY},m),sel=selection?OS._selectionCoverageAt(selection,Math.floor(doc.x),Math.floor(doc.y),docW,docH)/255:1;if(sel<=0)continue;
+            const strength=edge*flow*sel,idx=y*source.width+x,old=s.mask[idx]/255;
+            const next=erase?old*(1-strength):old+(1-old)*strength;s.mask[idx]=Math.round(clamp(next,0,1)*255);
+            bx0=Math.min(bx0,x);by0=Math.min(by0,y);bx1=Math.max(bx1,x);by1=Math.max(by1,y);
+        }
+        if(bx1>=bx0){const b=s.bounds;s.bounds=b?{x:Math.min(b.x,bx0),y:Math.min(b.y,by0),x2:Math.max(b.x2,bx1),y2:Math.max(b.y2,by1)}:{x:bx0,y:by0,x2:bx1,y2:by1};s.dirty=true;this._invalidateMaskCache();}
+    };
+
+    Skin.showCompareSplit = async function() {
+        const s=this.session;if(!s?.dirty){OS.toast('Paint or load a Skin Retouch mask first','info');return false;}
+        this._removeMaskOverlay();
+        const pixels=s.source.width*s.source.height,scale=pixels>2000000?Math.sqrt(2000000/pixels):1;
+        const before=document.createElement('canvas');before.width=Math.max(1,Math.round(s.source.width*scale));before.height=Math.max(1,Math.round(s.source.height*scale));before.getContext('2d').drawImage(s.source,0,0,before.width,before.height);
+        const after=this._render(scale),ui=modal('Before / After — Split View');
+        const wrap=el('div',{class:'kp-compare-wrap'}),afterImg=el('img',{class:'kp-compare-image',src:after.toDataURL('image/jpeg',.92),alt:'After Skin Retouch'}),beforeImg=el('img',{class:'kp-compare-image kp-compare-before',src:before.toDataURL('image/jpeg',.92),alt:'Before Skin Retouch'});
+        wrap.style.setProperty('--kp-split','50%');wrap.append(afterImg,beforeImg,el('span',{class:'kp-compare-label kp-after-label',text:'AFTER'}),el('span',{class:'kp-compare-label kp-before-label',text:'BEFORE'}));
+        const range=el('input',{type:'range',min:'0',max:'100',value:'50',class:'kp-compare-slider'});
+        range.addEventListener('input',()=>wrap.style.setProperty('--kp-split',range.value+'%'));
+        const close=button('Close','btn btn-primary');close.addEventListener('click',()=>{ui.close();if(this.maskParams.overlay)void this._refreshMaskOverlay();});
+        ui.box.append(wrap,range,el('div',{class:'kp-modal-actions'},[close]));return true;
+    };
+
+
+    Skin._findObjectById = function(id) {
+        return (OS.canvas?.getObjects?.() || []).find(object => object?._openShopObjectId === id) || null;
+    };
+    Skin._retouchObjects = function() {
+        return (OS.canvas?.getObjects?.() || []).filter(object => object?.[RETOUCH_PROP]);
+    };
+    Skin.listRetouchLayers = function() {
+        return this._retouchObjects().map(object => {
+            const layerIndex=(OS.layers||[]).findIndex(layer => (layer.objects||[]).includes(object));
+            const layer=OS.layers?.[layerIndex];
+            return { objectId:object._openShopObjectId||null, layerId:layer?.id||null, layerIndex,
+                name:layer?.name||object.name||'Skin Retouch', targetObjectId:object[RETOUCH_PROP]?.targetObjectId||null,
+                params:{ ...(object[RETOUCH_PROP]?.params||{}) } };
+        });
+    };
+    Skin._maskToDataUrl = function(mask,width,height) {
+        const canvas=document.createElement('canvas'); canvas.width=width; canvas.height=height;
+        const ctx=canvas.getContext('2d'); const image=ctx.createImageData(width,height);
+        for(let i=0;i<mask.length;i++){const p=i*4;image.data[p]=255;image.data[p+1]=255;image.data[p+2]=255;image.data[p+3]=mask[i];}
+        ctx.putImageData(image,0,0); return canvas.toDataURL('image/png');
+    };
+    Skin._maskFromDataUrl = async function(dataUrl,width,height) {
+        if(!dataUrl)return new Uint8Array(width*height);
+        const image=await fabric.FabricImage.fromURL(dataUrl); const source=image.getElement?.();
+        if(!source)return new Uint8Array(width*height);
+        const canvas=document.createElement('canvas');canvas.width=width;canvas.height=height;
+        const ctx=canvas.getContext('2d',{willReadFrequently:true});ctx.drawImage(source,0,0,width,height);
+        const rgba=ctx.getImageData(0,0,width,height).data,mask=new Uint8Array(width*height);
+        for(let i=0;i<mask.length;i++)mask[i]=rgba[i*4+3];
+        return mask;
+    };
+    Skin._renderRetouchOverlay = function() {
+        const s=this.session;if(!s?.dirty)return null;
+        const preview=this._render(1);if(!preview)return null;
+        const width=s.source.width,height=s.source.height;
+        const base=s.source.getContext('2d',{willReadFrequently:true}).getImageData(0,0,width,height);
+        const after=preview.getContext('2d',{willReadFrequently:true}).getImageData(0,0,width,height);
+        const out=document.createElement('canvas');out.width=width;out.height=height;
+        const outCtx=out.getContext('2d'),pixels=outCtx.createImageData(width,height);
+        for(let i=0;i<s.mask.length;i++){
+            const m=this._maskCoverageAt(s,i%s.source.width,Math.floor(i/s.source.width))/255;if(m<=0)continue;const p=i*4,safeM=Math.max(m,1/255);
+            for(let c=0;c<3;c++){const original=base.data[p+c],final=after.data[p+c];pixels.data[p+c]=clamp(original+(final-original)/safeM,0,255);}
+            pixels.data[p+3]=Math.round((base.data[p+3]||255)*m);
+        }
+        outCtx.putImageData(pixels,0,0);return out;
+    };
+    Skin._retouchMeta = function(target) {
+        const s=this.session;return {format:'kanpaint-skin-retouch',version:1,targetObjectId:OS._ensureObjectId(target),
+            params:{...this.params},maskParams:{...this.maskParams},maskDataUrl:this._maskToDataUrl(s.mask,s.source.width,s.source.height),
+            width:s.source.width,height:s.source.height,updatedAt:new Date().toISOString()};
+    };
+    Skin._buildRetouchImage = async function(canvas,target,objectId,meta,name='Skin Retouch') {
+        const image=await fabric.FabricImage.fromURL(canvas.toDataURL('image/png'));
+        const sourceW=Math.max(1,canvas.width),sourceH=Math.max(1,canvas.height);
+        const targetW=Math.max(1,Number(target.width)||sourceW),targetH=Math.max(1,Number(target.height)||sourceH);
+        image.set({left:target.left,top:target.top,scaleX:(Number(target.scaleX)||1)*(targetW/sourceW),scaleY:(Number(target.scaleY)||1)*(targetH/sourceH),
+            angle:target.angle,flipX:target.flipX,flipY:target.flipY,skewX:target.skewX,skewY:target.skewY,originX:target.originX,originY:target.originY,
+            opacity:target.opacity??1,globalCompositeOperation:'source-over',shadow:null,visible:true,selectable:true,clipPath:target.clipPath||null,name});
+        image._openShopObjectId=objectId||OS._newDocumentId('object');image[RETOUCH_PROP]=meta;image.dirty=true;image.setCoords?.();return image;
+    };
+    Skin.loadActiveRetouch = async function(active=null,{silent=false}={}) {
+        const object=active||OS.canvas?.getActiveObject?.(),meta=object?.[RETOUCH_PROP];
+        if(!object||!meta){if(!silent)OS.toast('Select a Skin Retouch layer first','info');return false;}
+        if(this.session?.editingObject===object)return true;
+        if(this.session)this.cancel({silent:true});
+        const layerIndex=(OS.layers||[]).findIndex(layer=>(layer.objects||[]).includes(object));
+        if(layerIndex<0||OS.layers[layerIndex]?.locked){if(!silent)OS.toast('Unlock the Skin Retouch layer first','info');return false;}
+        const target=this._findObjectById(meta.targetObjectId);
+        if(!target||target.type!=='image'){OS.toast('The original image for this Skin Retouch layer is missing','error');return false;}
+        const source=this._sourceCanvas(target);if(!source){OS.toast('Could not read the original image pixels','error');return false;}
+        const mask=await this._maskFromDataUrl(meta.maskDataUrl,source.width,source.height);
+        this.params={...this.params,...(meta.params||{})};this.maskParams={...this.maskParams,...(meta.maskParams||{})};this.outputMode='layer';
+        this.session={target,source,mask,dirty:mask.some(value=>value>0),bounds:{x:0,y:0,x2:source.width-1,y2:source.height-1},
+            editingObject:object,editingLayerIndex:layerIndex,guard:{generation:OS._documentGeneration,revision:OS._documentRevision,targetId:OS._ensureObjectId(target)}};
+        object.visible=false;target.dirty=true;OS.canvas?.renderAll?.();this._syncControls();this._updatePanelState();
+        this._setStatus('Editing non-destructive retouch layer: '+(OS.layers[layerIndex]?.name||'Skin Retouch'));
+        if(this.session.dirty)await this.preview();return true;
+    };
+    Skin._commitRetouchLayer = async function({silent=false}={}) {
+        const s=this.session;if(!s)return false;
+        if(!s.dirty){if(s.editingObject)s.editingObject.visible=true;try{OS._swapImageElement(s.target,s.source);}catch(_){}this.session=null;this._updatePanelState();OS.canvas?.renderAll?.();if(!silent)OS.toast('Skin Retouch mask is empty','info');return false;}
+        this._previewTicket++;try{OS._swapImageElement(s.target,s.source);}catch(_){}
+        const overlay=this._renderRetouchOverlay();if(!overlay)return false;const meta=this._retouchMeta(s.target);
+        let retouchObject=null,layerIndex=-1;
+        if(s.editingObject){
+            const old=s.editingObject;layerIndex=(OS.layers||[]).findIndex(layer=>(layer.objects||[]).includes(old));
+            if(layerIndex<0)throw new Error('Retouch layer no longer exists');
+            const objectId=OS._ensureObjectId(old);retouchObject=await this._buildRetouchImage(overlay,s.target,objectId,meta,old.name||'Skin Retouch');
+            const objectIndex=OS.layers[layerIndex].objects.indexOf(old);OS.layers[layerIndex].objects[objectIndex]=retouchObject;OS.canvas.remove(old);OS.canvas.add(retouchObject);
+            OS.layers[layerIndex].name=OS.layers[layerIndex].name||'Skin Retouch';
+        } else {
+            const targetLayerIndex=(OS.layers||[]).findIndex(layer=>(layer.objects||[]).includes(s.target));if(targetLayerIndex<0)throw new Error('Target layer no longer exists');
+            const targetLayer=OS.layers[targetLayerIndex];retouchObject=await this._buildRetouchImage(overlay,s.target,null,meta,'Skin Retouch');
+            const layer={id:OS._newDocumentId('layer'),name:'Skin Retouch',visible:true,locked:false,opacity:100,blend:'source-over',kind:'pixel',parentId:targetLayer.parentId||null,objects:[retouchObject]};
+            layerIndex=targetLayerIndex+1;OS.layers.splice(layerIndex,0,layer);OS.canvas.add(retouchObject);
+        }
+        OS.activeLayerIdx=layerIndex;OS._selectedLayerIds=[OS.layers[layerIndex].id];OS._enforceLayerInvariants();OS.canvas.setActiveObject(retouchObject);OS.updateLayersPanel();OS.canvas.renderAll();
+        OS.saveHistory(s.editingObject?'Update Skin Retouch Layer':'Create Skin Retouch Layer');
+        this.session=null;this.painting=false;this._updatePanelState();this._setStatus('Non-destructive Skin Retouch saved as its own layer');
+        if(!silent)OS.toast('Skin Retouch layer '+(s.editingObject?'updated':'created'),'success');return true;
+    };
+    const _skinApplyPixels=Skin.apply.bind(Skin),_skinCancelV03=Skin.cancel.bind(Skin),_skinBeforeV03=Skin.before.bind(Skin),_skinOnDownV03=Skin.onDown.bind(Skin),_skinUpdatePanelV03=Skin._updatePanelState.bind(Skin);
+    Skin.apply=async function(options={}){const editing=Boolean(this.session?.editingObject);if(editing||this.outputMode!=='pixels')return this._commitRetouchLayer(options);return _skinApplyPixels(options);};
+    Skin.cancel=function(options={}){const editing=this.session?.editingObject||null;const result=_skinCancelV03(options);if(editing){editing.visible=true;editing.dirty=true;OS.canvas?.renderAll?.();}return result;};
+    Skin.before=function(show){if(this.session?.editingObject)this.session.editingObject.visible=false;return _skinBeforeV03(show);};
+    Skin.onDown=function(opt){
+        const ptr=OS.canvas.getScenePoint(opt.e);let target=this.session?.editingObject?this.session.target:this._findTarget(ptr);
+        if(!target){OS.toast('Select or click an image before Skin Retouch','info');return;}if(!OS._guardObjectEdit?.(target))return;
+        try{this._startSession(target);this.painting=true;this._eraseMode=Boolean(opt.e?.altKey);this._paintV05(ptr,this._eraseMode);this._setStatus(this._eraseMode?'Erasing retouch mask…':'Painting retouch mask…');}
+        catch(e){OS.toast('Skin Retouch: '+e.message,'error');}
+    };
+    Skin.onMove=function(opt){if(!this.painting||!(opt.e.buttons&1))return;this._eraseMode=Boolean(opt.e?.altKey);this._paintV05(OS.canvas.getScenePoint(opt.e),this._eraseMode);};
+    Skin.onUp=function(){if(!this.painting)return;this.painting=false;if(this._eraseMode&&this.session){this.session.dirty=this.session.mask.some(value=>value>0);if(!this.session.dirty)this.session.bounds=null;}this._eraseMode=false;this.schedulePreview();void this._refreshMaskOverlay();};
+    Skin._updatePanelState=function(){_skinUpdatePanelV03();const mode=document.getElementById('kp-skin-mode-state');if(mode){const editing=Boolean(this.session?.editingObject);mode.textContent=editing?'Editing Retouch Layer':(this.outputMode==='pixels'?'Output: Pixels (destructive)':'Output: Retouch Layer (non-destructive)');}
+        const editBtn=document.getElementById('kp-skin-edit-active');if(editBtn)editBtn.disabled=!OS.canvas?.getActiveObject?.()?.[RETOUCH_PROP];
+        const output=document.getElementById('kp-skin-output');if(output){output.value=this.session?.editingObject?'layer':this.outputMode;output.disabled=Boolean(this.session?.editingObject);}
+        this._syncMaskControls();};
+
+    const _skinPreviewV04=Skin.preview.bind(Skin),_skinFillSelectionV04=Skin.fillSelection.bind(Skin),_skinClearMaskV04=Skin.clearMask.bind(Skin),_skinApplyV04=Skin.apply.bind(Skin),_skinCancelV04=Skin.cancel.bind(Skin),_skinBeforeV04=Skin.before.bind(Skin);
+    Skin.preview=async function(){const result=await _skinPreviewV04();if(this.maskParams.overlay)await this._refreshMaskOverlay();return result;};
+    Skin.fillSelection=async function(){const result=await _skinFillSelectionV04();if(result){this._invalidateMaskCache();if(this.maskParams.overlay)await this._refreshMaskOverlay();}return result;};
+    Skin.clearMask=function(){const result=_skinClearMaskV04();this._invalidateMaskCache();this._removeMaskOverlay();return result;};
+    Skin.apply=async function(options={}){this._removeMaskOverlay();return _skinApplyV04(options);};
+    Skin.cancel=function(options={}){this._removeMaskOverlay();return _skinCancelV04(options);};
+    Skin.before=function(show){if(show)this._removeMaskOverlay();const result=_skinBeforeV04(show);if(!show&&this.maskParams.overlay)setTimeout(()=>void this._refreshMaskOverlay(),0);return result;};
+
+    function addSkinUI() {
+        const toolbar=document.getElementById('toolbar');if(!toolbar||document.getElementById('kp-skin-tool'))return;
+        const retouchGroup=toolbar.querySelector('.tool-group[data-group="retouch"]');
+        const tool=el('button',{type:'button',id:'kp-skin-tool',class:'tool-btn','data-tool':'skin-retouch','data-tip':'Skin Retouch'});tool.dataset.tool='skin-retouch';tool.append(el('span',{class:'kp-tool-glyph',text:'SR'}));(retouchGroup||toolbar).after(tool);tool.addEventListener('click',()=>OS.setTool('skin-retouch'));
+        const options=document.getElementById('tool-options'),group=el('div',{class:'opt-group',id:'opt-kp-skin'});group.style.display='none';
+        const inlineSlider=(label,key,min,max,suffix='',step=1)=>{const input=el('input',{type:'range',min:String(min),max:String(max),step:String(step),value:String(Skin.params[key]),dataset:{kpSkinParam:key,suffix}}),out=el('output',{text:String(Skin.params[key])+suffix});input.addEventListener('input',()=>{Skin.params[key]=+input.value;out.textContent=input.value+suffix;});input.addEventListener('change',()=>{if(Skin.session?.dirty)void Skin.preview();});return el('label',{class:'kp-inline-control'},[el('span',{text:label}),input,out]);};
+        group.append(inlineSlider('Size','size',5,300,'px'),inlineSlider('Hardness','hardness',0,100,'%'),inlineSlider('Flow','flow',1,100,'%'),inlineSlider('Amount','amount',0,100,'%'));
+        const settings=button('Retouch Settings…'),apply=button('Apply','btn btn-primary'),cancel=button('Cancel');apply.id='kp-skin-apply';cancel.id='kp-skin-cancel';group.append(settings,apply,cancel);options.insertBefore(group,document.getElementById('tool-options-reset'));
+        settings.addEventListener('click',()=>document.getElementById('kp-skin-panel')?.classList.toggle('visible'));apply.addEventListener('click',()=>void Skin.apply());cancel.addEventListener('click',()=>Skin.cancel());
+
+        const panel=el('aside',{id:'kp-skin-panel'}),head=el('div',{class:'kp-panel-head'},[el('span',{text:'Skin Retouch'}),el('small',{text:'KanPaint v0.1'})]),body=el('div',{class:'kp-panel-body'});
+        const modeState=el('div',{id:'kp-skin-mode-state',class:'kp-selection-state',text:'Output: Retouch Layer (non-destructive)'}),selectionState=el('div',{class:'kp-selection-state',text:'Selection: none'});body.append(modeState,selectionState);
+        const output=el('select',{id:'kp-skin-output'});output.append(el('option',{value:'layer',text:'Retouch Layer — non-destructive'}),el('option',{value:'pixels',text:'Pixels — destructive'}));output.value=Skin.outputMode;output.addEventListener('change',()=>{Skin.outputMode=output.value;Skin._updatePanelState();});body.append(el('div',{class:'kp-form-row'},[el('label',{text:'Output'}),output]));
+        const preset=el('select');[['natural','Natural'],['soft','Soft Portrait'],['shadow','Shadow Fix'],['texture','Texture Restore']].forEach(([value,label])=>preset.append(el('option',{value,text:label})));body.append(el('div',{class:'kp-form-row'},[el('label',{text:'Preset'}),preset]));
+
+        const slider=(label,key,min,max,suffix='',step=1)=>{const input=el('input',{type:'range',min:String(min),max:String(max),step:String(step),value:String(Skin.params[key]),dataset:{kpSkinParam:key,suffix}}),out=el('output',{text:String(Skin.params[key])+suffix});input.addEventListener('input',()=>{Skin.params[key]=+input.value;out.textContent=input.value+suffix;});input.addEventListener('change',()=>{if(Skin.session?.dirty)void Skin.preview();});return el('div',{class:'kp-slider-row'},[el('label',{text:label}),input,out]);};
+        body.append(slider('Smooth','smooth',0,100,'%'),slider('Light / Dark','light',-50,50,''),slider('Shadow Lift','shadows',0,100,'%'),slider('Shine Reduce','shine',0,100,'%'),slider('Even Skin Tone','tone',0,100,'%'),slider('Warm / Cool','warmth',-50,50,''),slider('Texture / Pores','texture',0,100,'%'),slider('Grain Size','grainSize',0.5,3,'',0.1),slider('Detail Preserve','preserve',0,100,'%'));
+
+        body.append(el('div',{class:'kp-section-title',text:'MASK'}));
+        const maskSlider=(label,key,min,max,suffix='',step=1)=>{const input=el('input',{type:'range',min:String(min),max:String(max),step:String(step),value:String(Skin.maskParams[key]),dataset:{kpMaskParam:key,suffix}}),out=el('output',{text:String(Skin.maskParams[key])+suffix});input.addEventListener('input',()=>out.textContent=input.value+suffix);input.addEventListener('change',()=>Skin.setMaskParam(key,+input.value));return el('div',{class:'kp-slider-row'},[el('label',{text:label}),input,out]);};
+        body.append(maskSlider('Feather','feather',0,60,'px'),maskSlider('Density','density',0,100,'%'));
+        const overlayToggle=el('input',{type:'checkbox',checked:true,dataset:{kpMaskParam:'overlay'}});overlayToggle.addEventListener('change',()=>Skin.setMaskParam('overlay',overlayToggle.checked));
+        body.append(el('label',{class:'kp-check-row'},[overlayToggle,el('span',{text:'Show red mask overlay'})]));
+
+        const status=el('div',{id:'kp-skin-status',class:'kp-progress',text:'Paint mask. Hold Alt while brushing to erase mask.'});body.append(status,el('p',{class:'kp-help',text:'Alt + brush erases the mask. Feather and Density stay editable and are saved with a non-destructive Retouch Layer.'}));
+        const maskActions=el('div',{class:'kp-panel-actions'}),useSelection=button('Use Selection'),invert=button('Invert Mask'),clearMask=button('Clear Mask'),editActive=button('Edit Active Retouch');editActive.id='kp-skin-edit-active';maskActions.append(useSelection,invert,clearMask,editActive);body.append(maskActions);
+        const compare=button('Before / After Split'),before=button('Hold: Before'),pApply=button('Apply','btn btn-primary'),pCancel=button('Cancel'),actions=el('div',{class:'kp-panel-actions'});actions.append(compare,before,pApply,pCancel);body.append(actions);
+        panel.append(head,body);document.body.append(panel);
+
+        preset.addEventListener('change',()=>Skin.applyPreset(preset.value));useSelection.addEventListener('click',()=>void Skin.fillSelection());invert.addEventListener('click',()=>Skin.invertMask());clearMask.addEventListener('click',()=>Skin.clearMask());editActive.addEventListener('click',()=>void Skin.loadActiveRetouch());compare.addEventListener('click',()=>void Skin.showCompareSplit());
+        before.addEventListener('pointerdown',()=>{before.classList.add('kp-before-active');Skin.before(true);});const restore=()=>{before.classList.remove('kp-before-active');Skin.before(false);};before.addEventListener('pointerup',restore);before.addEventListener('pointerleave',restore);pApply.addEventListener('click',()=>void Skin.apply());pCancel.addEventListener('click',()=>Skin.cancel());Skin._updatePanelState();
+    }
+
+
+    // ---------------------------------------------------------------------
+    // KanPaint 0.1 Automation API v1
+    // Stable, sandboxed automation surface. Top-level aliases mirror kan.v1
+    // so scripts written for API v1 continue to run in later KanPaint builds.
+    // ---------------------------------------------------------------------
+    const API_VERSION = '1.0';
+    const HOTKEY_KEY = 'kanpaint.hotkeys.v1';
+    const EVENT_KEY = 'kanpaint.script-events.v1';
+    const SCRIPT_EVENTS = ['onOpen','beforeExport','afterExport','beforeSave','afterSave','beforeBatchItem','afterBatchItem','onError'];
+
+    const Automation = {
+        apiVersion:API_VERSION,
+        _eventGuard:new Set(),
+        _layerIndex(id) {
+            const index=(OS.layers||[]).findIndex(layer=>layer?.id===id);
+            if(index<0) throw new Error('Layer not found');
+            return index;
+        },
+        _selectLayer(id) {
+            const index=this._layerIndex(id),layer=OS.layers[index];
+            OS.activeLayerIdx=index; OS._selectedLayerIds=[layer.id];
+            const object=(layer.objects||[]).find(o=>o?.name!=='__boundary__') || null;
+            if(object&&OS.canvas?.setActiveObject) OS.canvas.setActiveObject(object);
+            OS.updateLayersPanel?.(); OS.canvas?.requestRenderAll?.();
+            return {id:layer.id,index,name:layer.name};
+        },
+        async _duplicateLayer(id) {
+            const index=this._layerIndex(id); this._selectLayer(id);
+            const source=OS.layers[index], clones=[];
+            for(const object of (source.objects||[])) {
+                if(object?.name==='__boundary__') continue;
+                const cloned=await object.clone();
+                cloned._openShopObjectId=OS._newDocumentId?.('object') || ('object-'+Date.now()+'-'+Math.random());
+                clones.push(cloned); OS.canvas?.add(cloned);
+            }
+            const layer={...source,id:OS._newDocumentId?.('layer')||('layer-'+Date.now()),name:safeName((source.name||'Layer')+' copy'),objects:clones,parentId:source.parentId||null};
+            OS.layers.splice(index+1,0,layer); OS.activeLayerIdx=index+1; OS._selectedLayerIds=[layer.id];
+            OS._enforceLayerInvariants?.(); OS.updateLayersPanel?.(); OS.canvas?.requestRenderAll?.(); OS.saveHistory?.('Duplicate Layer');
+            return {id:layer.id,index:index+1,name:layer.name};
+        },
+        _removeLayer(id) {
+            const index=this._layerIndex(id); this._selectLayer(id);
+            if(typeof OS.deleteLayer==='function') OS.deleteLayer();
+            else {
+                const layer=OS.layers[index]; (layer.objects||[]).forEach(o=>OS.canvas?.remove(o)); OS.layers.splice(index,1);
+                if(!OS.layers.length) OS.addLayer?.(); OS.activeLayerIdx=Math.max(0,Math.min(index,OS.layers.length-1));
+                OS._enforceLayerInvariants?.(); OS.updateLayersPanel?.(); OS.canvas?.requestRenderAll?.(); OS.saveHistory?.('Delete Layer');
+            }
+            return true;
+        },
+        _setLocked(id,locked) {
+            const index=this._layerIndex(id),layer=OS.layers[index];
+            if(Boolean(layer.locked)!==Boolean(locked)) {
+                if(typeof OS.toggleLayerLock==='function') OS.toggleLayerLock(index); else layer.locked=Boolean(locked);
+            }
+            OS._applyLayerInteractionState?.(); OS.updateLayersPanel?.(); return true;
+        },
+        _setOpacity(id,opacity) {
+            const index=this._layerIndex(id),value=clamp(opacity,0,100); this._selectLayer(id);
+            if(typeof OS.setLayerOpacity==='function') OS.setLayerOpacity(value);
+            else { OS.layers[index].opacity=value; (OS.layers[index].objects||[]).forEach(o=>o.set?.({opacity:value/100})); OS.canvas?.requestRenderAll?.(); OS.saveHistory?.('Layer Opacity'); }
+            return value;
+        },
+        _moveLayer(id,toIndex) {
+            const from=this._layerIndex(id),to=Math.max(0,Math.min((OS.layers?.length||1)-1,Math.round(toIndex)));
+            if(from===to) return true;
+            if(typeof OS._moveLayer==='function') return Boolean(OS._moveLayer(from,to));
+            const [layer]=OS.layers.splice(from,1);OS.layers.splice(to,0,layer);OS._enforceLayerInvariants?.();OS.updateLayersPanel?.();OS.canvas?.requestRenderAll?.();OS.saveHistory?.('Reorder Layers');return true;
+        },
+        _resizeLayer(id,args={}) {
+            const index=this._layerIndex(id),layer=OS.layers[index],objects=(layer.objects||[]).filter(o=>o?.name!=='__boundary__');
+            if(!objects.length) throw new Error('Layer has no drawable objects');
+            const percent=Number(args.percent);
+            const factor=Number.isFinite(percent)&&percent>0 ? percent/100 : null;
+            for(const object of objects) {
+                if(factor){ object.scaleX=(Number(object.scaleX)||1)*factor; object.scaleY=(Number(object.scaleY)||1)*factor; }
+                else {
+                    const rect=object.getBoundingRect?.()||{width:Number(object.width)||1,height:Number(object.height)||1};
+                    const keep=args.keepAspect!==false;
+                    if(Number(args.width)>0){const sx=Number(args.width)/Math.max(1,rect.width);object.scaleX=(Number(object.scaleX)||1)*sx;if(keep)object.scaleY=(Number(object.scaleY)||1)*sx;}
+                    if(!keep&&Number(args.height)>0){const sy=Number(args.height)/Math.max(1,rect.height);object.scaleY=(Number(object.scaleY)||1)*sy;}
+                    else if(!Number(args.width)&&Number(args.height)>0){const sy=Number(args.height)/Math.max(1,rect.height);object.scaleX=(Number(object.scaleX)||1)*sy;object.scaleY=(Number(object.scaleY)||1)*sy;}
+                }
+                object.setCoords?.(); object.dirty=true;
+            }
+            OS.canvas?.requestRenderAll?.(); OS.saveHistory?.('Resize Layer'); return true;
+        },
+        _selectionObject() {
+            const m=OS._selectionMask;
+            if(m?.mask&&m.w&&m.h) return {w:m.w,h:m.h,mask:new Uint8Array(m.mask)};
+            const b=OS._selectionBounds;if(!b)return null;
+            const w=Math.max(1,Math.round(OS.canvasW||1)),h=Math.max(1,Math.round(OS.canvasH||1)),mask=new Uint8Array(w*h);
+            const x0=Math.max(0,Math.floor(b.x)),y0=Math.max(0,Math.floor(b.y)),x1=Math.min(w,Math.ceil(b.x+b.w)),y1=Math.min(h,Math.ceil(b.y+b.h));
+            for(let y=y0;y<y1;y++)mask.fill(255,y*w+x0,y*w+x1);
+            return {w,h,mask};
+        },
+        _setSelection(sel) {
+            if(!sel){OS._selectionMask=null;OS._selectionBounds=null;OS._removeSelectionVisuals?.();OS.canvas?.requestRenderAll?.();return true;}
+            OS._selectionMask={w:sel.w,h:sel.h,mask:sel.mask};
+            let minX=sel.w,minY=sel.h,maxX=-1,maxY=-1;
+            for(let y=0;y<sel.h;y++)for(let x=0;x<sel.w;x++)if(sel.mask[y*sel.w+x]){minX=Math.min(minX,x);minY=Math.min(minY,y);maxX=Math.max(maxX,x);maxY=Math.max(maxY,y);}
+            OS._selectionBounds=maxX>=minX?{x:minX,y:minY,w:maxX-minX+1,h:maxY-minY+1}:null;
+            OS._syncSelectionVisuals?.();OS.canvas?.requestRenderAll?.();return true;
+        },
+        _morphSelection(mode,radius=1) {
+            const sel=this._selectionObject();if(!sel)throw new Error('No active selection');
+            radius=Math.max(1,Math.min(50,Math.round(radius)));const {w,h}=sel;let src=sel.mask;
+            if(mode==='feather'){
+                const tmp=new Float32Array(src.length),out=new Uint8Array(src.length),span=radius*2+1;
+                for(let y=0;y<h;y++){let sum=0;for(let x=-radius;x<=radius;x++)sum+=src[y*w+Math.max(0,Math.min(w-1,x))];for(let x=0;x<w;x++){tmp[y*w+x]=sum/span;sum+=src[y*w+Math.min(w-1,x+radius+1)]-src[y*w+Math.max(0,x-radius)];}}
+                for(let x=0;x<w;x++){let sum=0;for(let y=-radius;y<=radius;y++)sum+=tmp[Math.max(0,Math.min(h-1,y))*w+x];for(let y=0;y<h;y++){out[y*w+x]=Math.round(sum/span);sum+=tmp[Math.min(h-1,y+radius+1)*w+x]-tmp[Math.max(0,y-radius)*w+x];}}
+                return this._setSelection({w,h,mask:out});
+            }
+            const out=new Uint8Array(src.length),grow=mode==='expand';
+            for(let y=0;y<h;y++)for(let x=0;x<w;x++){
+                let hit=grow?0:255;
+                outer:for(let yy=Math.max(0,y-radius);yy<=Math.min(h-1,y+radius);yy++)for(let xx=Math.max(0,x-radius);xx<=Math.min(w-1,x+radius);xx++){
+                    const v=src[yy*w+xx];if(grow&&v){hit=255;break outer;}if(!grow&&!v){hit=0;break outer;}
+                }
+                out[y*w+x]=hit;
+            }
+            return this._setSelection({w,h,mask:out});
+        },
+        async _filter(kind,args={}) {
+            const layer=OS.layers?.[OS.activeLayerIdx],target=(layer?.objects||[]).find(o=>o?.type==='image');
+            if(!target) throw new Error('Select a pixel/image layer first');
+            if(!OS._guardObjectEdit?.(target)) throw new Error('Layer cannot be edited');
+            const image=target.getElement?.();if(!image)throw new Error('Could not read image pixels');
+            const c=document.createElement('canvas');c.width=image.naturalWidth||image.width||target.width||1;c.height=image.naturalHeight||image.height||target.height||1;
+            const ctx=c.getContext('2d',{willReadFrequently:true});
+            if(kind==='blur'){ctx.filter='blur('+clamp(args.radius||2,0,50)+'px)';ctx.drawImage(image,0,0,c.width,c.height);}
+            else if(kind==='brightnessContrast'){ctx.filter='brightness('+(100+clamp(args.brightness||0,-100,100))+'%) contrast('+(100+clamp(args.contrast||0,-100,100))+'%)';ctx.drawImage(image,0,0,c.width,c.height);}
+            else {
+                ctx.drawImage(image,0,0,c.width,c.height);const data=ctx.getImageData(0,0,c.width,c.height),d=data.data;
+                if(kind==='invert')for(let i=0;i<d.length;i+=4){d[i]=255-d[i];d[i+1]=255-d[i+1];d[i+2]=255-d[i+2];}
+                else if(kind==='grayscale')for(let i=0;i<d.length;i+=4){const v=Math.round(d[i]*.2126+d[i+1]*.7152+d[i+2]*.0722);d[i]=d[i+1]=d[i+2]=v;}
+                else throw new Error('Unsupported filter: '+kind);
+                ctx.putImageData(data,0,0);
+            }
+            const guard={generation:OS._documentGeneration,revision:OS._documentRevision,targetId:OS._ensureObjectId?.(target)};
+            return Boolean(await OS._replaceActiveImage(target,c.toDataURL('image/png'),'Automation Filter: '+kind,guard));
+        },
+        async _resizeDocument(args={}) {
+            const width=Math.max(1,Math.min(32768,Math.round(Number(args.width)||OS.canvasW||1))),height=Math.max(1,Math.min(32768,Math.round(Number(args.height)||OS.canvasH||1)));
+            if(OS._makeCommand&&OS._invokeCommand) return OS._invokeCommand(OS._makeCommand('canvas.resize',{width,height}));
+            throw new Error('Canvas resize command is unavailable');
+        },
+        _loadHotkeys() {
+            const defaults={'Ctrl+Shift+R':'recent','Ctrl+Alt+L':'library','Ctrl+Alt+E':'export','Ctrl+Alt+B':'batch','Ctrl+Alt+S':'skin','Ctrl+Alt+H':'help'};
+            try{return {...defaults,...JSON.parse(localStorage.getItem(HOTKEY_KEY)||'{}')};}catch(_){return defaults;}
+        },
+        _saveHotkeys(map){localStorage.setItem(HOTKEY_KEY,JSON.stringify(map));return map;},
+        _combo(event){const p=[];if(event.ctrlKey||event.metaKey)p.push('Ctrl');if(event.altKey)p.push('Alt');if(event.shiftKey)p.push('Shift');const k=event.key.length===1?event.key.toUpperCase():event.key;p.push(k);return p.join('+');},
+        _loadEvents(){try{return JSON.parse(localStorage.getItem(EVENT_KEY)||'{}')||{};}catch(_){return {};}},
+        _saveEvents(map){localStorage.setItem(EVENT_KEY,JSON.stringify(map));return map;},
+        async fireEvent(name,detail={}) {
+            if(!SCRIPT_EVENTS.includes(name)||this._eventGuard.has(name))return false;
+            const id=this._loadEvents()[name];if(!id)return false;
+            const script=ScriptEngine.list().find(item=>item.id===id);if(!script)return false;
+            this._eventGuard.add(name);
+            try{return await ScriptEngine.run(script.source,{name:'Event '+name+' · '+script.name,event:{name,detail}});}
+            catch(error){console.warn('[KanPaint event]',name,error);return false;}
+            finally{this._eventGuard.delete(name);}
+        },
+        async _pickBatch(args={}) {
+            if(typeof OS.runBatch!=='function')throw new Error('Batch engine unavailable');
+            const directory=Boolean(args.directory),input=el('input',{type:'file',multiple:true,accept:'image/*,.psd,.ora'});
+            if(directory)input.setAttribute('webkitdirectory','');
+            const files=await new Promise(resolve=>{input.addEventListener('change',()=>resolve([...input.files||[]]),{once:true});input.click();});
+            if(!files.length)return {cancelled:true,processed:[],failed:[]};
+            const commands=Array.isArray(args.commands)?args.commands:[];
+            if(!commands.length)throw new Error('Batch requires at least one OpenShop command');
+            const recipe={kind:'openshop-command-sequence',schemaVersion:1,commands};
+            let lastIndex=0;
+            return OS.runBatch(files,recipe,{format:args.format||'png',onProgress:detail=>{
+                if(detail?.index!==lastIndex){if(lastIndex)void this.fireEvent('afterBatchItem',{index:lastIndex});lastIndex=detail.index||lastIndex;void this.fireEvent('beforeBatchItem',{index:lastIndex,name:detail?.name||''});}
+            }}).then(result=>{if(lastIndex)void this.fireEvent('afterBatchItem',{index:lastIndex});return result;});
+        },
+        templates:[
+            {id:'hello',name:'Hello KanPaint API v1',source:"const info=await kan.app.info();\nawait kan.ui.toast('KanPaint '+info.version+' · API '+info.apiVersion,'info');"},
+            {id:'export-selected',name:'Export selected assets',source:"await kan.export.selected({trim:true,padding:3,zip:true});"},
+            {id:'rename-assets',name:'Rename layers asset_001…',source:"const layers=await kan.layers.list();\nlet n=1;\nfor(const L of layers){if(L.kind==='group')continue;await kan.layers.rename(L.id,'asset_'+String(n++).padStart(3,'0'));}\nawait kan.ui.toast('Renamed '+(n-1)+' layers','success');"},
+            {id:'portrait-natural',name:'Skin Retouch — Natural',source:"const s=await kan.selection.info();\nawait kan.skin.preset('natural');\nawait kan.ui.toast(s.active?'Natural preset ready. Open Skin Retouch and choose Use Selection.':'Natural preset ready. Make a skin selection, then open Skin Retouch.','info');"},
+            {id:'batch-1024',name:'Batch folder — resize canvas 1024×1024',source:"await kan.batch.pickFolderAndRun([{schemaVersion:1,id:'canvas.resize',args:{width:1024,height:1024}}],{format:'png'});"}
+        ],
+        showTemplates() {
+            const ui=modal('New Script from Template');const list=el('div',{class:'kp-script-list'});
+            for(const t of this.templates){const meta=el('div',{},[el('strong',{text:t.name}),el('small',{text:'API v1 template'})]);const use=button('Use Template');use.addEventListener('click',()=>{ui.close();ScriptEngine._showEditor({id:null,name:t.name,description:'Created from KanPaint template',source:t.source},()=>{});});list.append(el('div',{class:'kp-script-row'},[meta,el('div',{class:'kp-script-actions'},[use])]));}
+            const close=button('Close');close.addEventListener('click',ui.close);ui.box.append(list,el('div',{class:'kp-modal-actions'},[close]));
+        },
+        showHotkeys() {
+            const ui=modal('Script & Automation Hotkeys'),map=this._loadHotkeys(),body=el('div');
+            const commands=[['recent','Run Last Script'],['library','Script Library'],['export','Export Layers'],['batch','Batch Runner'],['skin','Skin Retouch'],['help','KanPaint Guide']];
+            for(const [id,label] of commands){const current=Object.entries(map).find(([,v])=>v===id)?.[0]||'';const input=el('input',{type:'text',value:current,placeholder:'Ctrl+Alt+…'});input.addEventListener('keydown',e=>{e.preventDefault();input.value=this._combo(e);});body.append(el('div',{class:'kp-form-row'},[el('label',{text:label}),input]));input.dataset.command=id;}
+            const save=button('Save','btn btn-primary'),close=button('Cancel');save.addEventListener('click',()=>{const next={};body.querySelectorAll('input[data-command]').forEach(i=>{if(i.value.trim())next[i.value.trim()]=i.dataset.command;});this._saveHotkeys(next);ui.close();OS.toast('Hotkeys saved','success');});close.addEventListener('click',ui.close);ui.box.append(body,el('div',{class:'kp-modal-actions'},[close,save]));
+        },
+        showEvents() {
+            const ui=modal('Script Events'),map=this._loadEvents(),body=el('div'),scripts=ScriptEngine.list();
+            for(const eventName of SCRIPT_EVENTS){const select=el('select');select.append(el('option',{value:'',text:'— Disabled —'}));scripts.forEach(s=>select.append(el('option',{value:s.id,text:s.name})));select.value=map[eventName]||'';select.dataset.event=eventName;body.append(el('div',{class:'kp-form-row'},[el('label',{text:eventName}),select]));}
+            const save=button('Save','btn btn-primary'),close=button('Cancel');save.addEventListener('click',()=>{const next={};body.querySelectorAll('select[data-event]').forEach(s=>{if(s.value)next[s.dataset.event]=s.value;});this._saveEvents(next);ui.close();OS.toast('Script Events saved','success');});close.addEventListener('click',ui.close);ui.box.append(el('p',{text:'Bind a saved or built-in script to editor events. Event scripts run in the same sandbox as normal scripts.'}),body,el('div',{class:'kp-modal-actions'},[close,save]));
+        },
+        showBatch() {
+            const ui=modal('Batch Runner');const intro=el('p',{text:'Process many images with OpenShop command recipes. Choose multiple files or an entire folder; results are returned by the existing batch engine.'});
+            const preset=el('select');preset.append(el('option',{value:'1024',text:'Resize canvas to 1024×1024'}),el('option',{value:'512',text:'Resize canvas to 512×512'}));
+            const mode=el('select');mode.append(el('option',{value:'files',text:'Choose files'}),el('option',{value:'folder',text:'Choose folder'}));
+            const progress=el('div',{class:'kp-progress'}),run=button('Run Batch','btn btn-primary'),cancel=button('Close');
+            const row=(label,control)=>ui.box.append(el('div',{class:'kp-form-row'},[el('label',{text:label}),control]));ui.box.append(intro);row('Source',mode);row('Recipe',preset);ui.box.append(progress,el('div',{class:'kp-modal-actions'},[cancel,run]));
+            cancel.addEventListener('click',ui.close);run.addEventListener('click',async()=>{run.disabled=true;try{const size=Number(preset.value);progress.textContent='Choose images…';const result=await this._pickBatch({directory:mode.value==='folder',commands:[{schemaVersion:1,id:'canvas.resize',args:{width:size,height:size}}],format:'png'});progress.textContent=result.cancelled?'Batch cancelled':'Batch finished';}catch(e){progress.textContent='Batch failed: '+e.message;OS.toast(progress.textContent,'error');}finally{run.disabled=false;}});
+        },
+        showHelp(topic='overview') {
+            const ui=modal('KanPaint Guide'),select=el('select'),content=el('div',{class:'kp-guide-content'});
+            const guides={
+                overview:['KanPaint 0.1','Đây là bản bắt đầu sử dụng chính thức. Giao diện xanh lá pastel, giữ workflow kiểu Photoshop/Photopea. File có Export Layers, Scripts và Automation.'],
+                skin:['Retouch da','1. Chọn layer ảnh. 2. Selection vùng da nếu cần. 3. Chọn Skin Retouch > Natural hoặc Soft Portrait. 4. Quét mask; giữ Alt để xóa mask. 5. Bật red mask overlay. 6. Smooth khoảng 25–45, Texture/Pores 10–25, Detail Preserve 70–90. 7. Feather 4–12 px, Density 60–85%. 8. So sánh Before/After rồi Apply. Retouch Layer mặc định không phá ảnh gốc.'],
+                scripts:['Dùng Script','Vào File > Scripts > Script Library. Bấm Run để chạy. New From Template tạo script mẫu. Script chạy sandbox và dùng API kan.v1. Gán phím tắt ở Assign Hotkeys; tự chạy theo onOpen/beforeExport/afterSave tại Script Events.'],
+                assets:['Tách asset game nhanh','Mỗi tóc/váy/phụ kiện nên nằm trên một layer và đặt tên rõ. Chọn các layer cần xuất, chạy script “Game Asset — Selected Trim + ZIP” hoặc File > Export Layers. Bật Auto Trim, padding 2–4 px và PNG trong suốt. Nếu game cần giữ đúng vị trí toàn canvas thì không trim, hoặc lưu offset riêng.'],
+                batch:['Batch','File > Batch Runner cho phép chọn nhiều file hoặc folder. Batch dùng command recipe ổn định của OpenShop. Template Batch 1024×1024 có sẵn trong Script Templates.'],
+                api:['Automation API v1','Dùng kan.apiVersion hoặc kan.v1. API v1 giữ tương thích về sau; top-level kan.layers/kan.selection/... là alias. Các nhóm chính: layers, selection, filters, export, batch, skin, document, ui.']
+            };
+            Object.entries(guides).forEach(([id,[title]])=>select.append(el('option',{value:id,text:title})));select.value=guides[topic]?topic:'overview';
+            const render=()=>{content.replaceChildren();const [title,text]=guides[select.value];content.append(el('h4',{text:title}),el('p',{text}));};select.addEventListener('change',render);render();
+            const close=button('Close','btn btn-primary');close.addEventListener('click',ui.close);ui.box.append(el('div',{class:'kp-form-row'},[el('label',{text:'Topic'}),select]),content,el('div',{class:'kp-modal-actions'},[close]));
+        },
+        install() {
+            // Useful built-in scripts for daily work.
+            const extras=[
+                {id:'builtin.skin-natural',name:'Skin — Natural setup',builtin:true,description:'Prepares a natural skin-retouch preset and explains the next action.',source:this.templates.find(t=>t.id==='portrait-natural').source},
+                {id:'builtin.skin-soft',name:'Skin — Soft Portrait setup',builtin:true,description:'Prepares Soft Portrait Skin Retouch.',source:"await kan.skin.preset('soft');\nawait kan.ui.toast('Soft Portrait preset ready. Select skin, then Use Selection or brush the mask.','info');"},
+                {id:'builtin.asset-selected',name:'Game Asset — Selected Trim + ZIP',builtin:true,description:'Exports selected layers as transparent trimmed PNG assets with 3px padding.',source:this.templates.find(t=>t.id==='export-selected').source},
+                {id:'builtin.asset-visible',name:'Game Asset — Visible Pack',builtin:true,description:'Exports every visible drawable layer to a trimmed transparent PNG ZIP.',source:"await kan.export.visible({trim:true,padding:3,zip:true});"},
+                {id:'builtin.rename-assets',name:'Game Asset — Rename asset_001…',builtin:true,description:'Renames drawable layers sequentially.',source:this.templates.find(t=>t.id==='rename-assets').source},
+                {id:'builtin.batch-1024',name:'Batch — Resize folder to 1024×1024',builtin:true,description:'Select a folder and process images through the OpenShop batch engine.',source:this.templates.find(t=>t.id==='batch-1024').source}
+            ];
+            for(const item of extras) if(!ScriptEngine.builtins.some(x=>x.id===item.id)) ScriptEngine.builtins.push(item);
+
+            const oldBridge=ScriptEngine._bridge.bind(ScriptEngine);
+            ScriptEngine._bridge=(method,args={})=>{
+                if(method==='app.info')return {version:VERSION,apiVersion:API_VERSION};
+                if(method==='document.resize')return this._resizeDocument(args);
+                if(method==='layers.select')return this._selectLayer(args.id);
+                if(method==='layers.setLocked')return this._setLocked(args.id,args.locked);
+                if(method==='layers.setOpacity')return this._setOpacity(args.id,args.opacity);
+                if(method==='layers.move')return this._moveLayer(args.id,args.toIndex);
+                if(method==='layers.duplicate')return this._duplicateLayer(args.id);
+                if(method==='layers.remove')return this._removeLayer(args.id);
+                if(method==='layers.resize')return this._resizeLayer(args.id,args);
+                if(method==='selection.clear')return this._setSelection(null);
+                if(method==='selection.selectAll'){const w=Math.max(1,Math.round(OS.canvasW||1)),h=Math.max(1,Math.round(OS.canvasH||1)),mask=new Uint8Array(w*h);mask.fill(255);return this._setSelection({w,h,mask});}
+                if(method==='selection.invert'){let s=this._selectionObject();if(!s){const w=Math.max(1,Math.round(OS.canvasW||1)),h=Math.max(1,Math.round(OS.canvasH||1)),mask=new Uint8Array(w*h);mask.fill(255);s={w,h,mask};}else for(let i=0;i<s.mask.length;i++)s.mask[i]=255-s.mask[i];return this._setSelection(s);}
+                if(method==='selection.expand')return this._morphSelection('expand',args.px);
+                if(method==='selection.contract')return this._morphSelection('contract',args.px);
+                if(method==='selection.feather')return this._morphSelection('feather',args.px);
+                if(method==='filters.apply')return this._filter(String(args.kind||''),args);
+                if(method==='export.layers')return LayerExport.export(args||{});
+                if(method==='batch.pickAndRun')return this._pickBatch({...args,directory:false});
+                if(method==='batch.pickFolderAndRun')return this._pickBatch({...args,directory:true});
+                if(method==='skin.setParam'){if(!(args.key in Skin.params))throw new Error('Unknown Skin parameter');Skin.params[args.key]=Number(args.value);Skin._syncControls();if(Skin.session?.dirty)void Skin.preview();return {...Skin.params};}
+                return oldBridge(method,args);
+            };
+
+            const oldWrapped=ScriptEngine._wrappedSource.bind(ScriptEngine);
+            ScriptEngine._wrappedSource=(source)=>{
+                let out=oldWrapped(source);
+                out=out.replace("  version:'"+VERSION+"',\n","  version:'"+VERSION+"',\n  apiVersion:'"+API_VERSION+"',\n  app:Object.freeze({info:()=>request('app.info')}),\n");
+                out=out.replace("  document:Object.freeze({info:()=>request('document.info')}),\n","  document:Object.freeze({info:()=>request('document.info'),resize:(width,height)=>request('document.resize',{width,height})}),\n");
+                out=out.replace(/  layers:Object\.freeze\(\{[^\n]+\}\),\n/, "  layers:Object.freeze({list:()=>request('layers.list'),getAll:()=>request('layers.list'),active:()=>request('layers.active'),select:(id)=>request('layers.select',{id}),rename:(id,name)=>request('layers.rename',{id,name}),setVisible:(id,visible)=>request('layers.setVisible',{id,visible}),setLocked:(id,locked)=>request('layers.setLocked',{id,locked}),setOpacity:(id,opacity)=>request('layers.setOpacity',{id,opacity}),move:(id,toIndex)=>request('layers.move',{id,toIndex}),duplicate:(id)=>request('layers.duplicate',{id}),remove:(id)=>request('layers.remove',{id}),resize:(id,o={})=>request('layers.resize',{id,...o}),export:(o={})=>request('layers.export',o)}),\n");
+                out=out.replace(/  selection:Object\.freeze\(\{[^\n]+\}\),\n/, "  selection:Object.freeze({info:()=>request('selection.info'),clear:()=>request('selection.clear'),selectAll:()=>request('selection.selectAll'),invert:()=>request('selection.invert'),expand:(px)=>request('selection.expand',{px}),contract:(px)=>request('selection.contract',{px}),feather:(px)=>request('selection.feather',{px})}),\n");
+                out=out.replace("  ui:Object.freeze({toast:(message,type='info')=>request('ui.toast',{message,type})})\n",
+"  filters:Object.freeze({apply:(kind,o={})=>request('filters.apply',{kind,...o}),brightnessContrast:(o={})=>request('filters.apply',{kind:'brightnessContrast',...o}),blur:(radius=2)=>request('filters.apply',{kind:'blur',radius}),grayscale:()=>request('filters.apply',{kind:'grayscale'}),invert:()=>request('filters.apply',{kind:'invert'})}),\n  export:Object.freeze({layers:(o={})=>request('export.layers',o),selected:(o={})=>request('export.layers',{scope:'selected',...o}),visible:(o={})=>request('export.layers',{scope:'visible',...o}),all:(o={})=>request('export.layers',{scope:'all',...o})}),\n  batch:Object.freeze({pickAndRun:(commands,o={})=>request('batch.pickAndRun',{commands,...o}),pickFolderAndRun:(commands,o={})=>request('batch.pickFolderAndRun',{commands,...o})}),\n  ui:Object.freeze({toast:(message,type='info')=>request('ui.toast',{message,type})})\n");
+                out=out.replace("});\n(async()=>{ try {","});\nkan.v1=Object.freeze({app:kan.app,document:kan.document,layers:kan.layers,selection:kan.selection,filters:kan.filters,export:kan.export,batch:kan.batch,skin:kan.skin,ui:kan.ui});\n(async()=>{ try {");
+                return out;
+            };
+
+            const oldRun=ScriptEngine.run.bind(ScriptEngine);
+            ScriptEngine.run=(source,options={})=>oldRun(source,options).catch(error=>{if(!String(options?.name||'').startsWith('Event onError'))void this.fireEvent('onError',{message:error.message});throw error;});
+
+            const oldExport=LayerExport.export.bind(LayerExport);
+            LayerExport.export=async(options={})=>{await this.fireEvent('beforeExport',{scope:options.scope||'visible'});const result=await oldExport(options);await this.fireEvent('afterExport',result);return result;};
+
+            if(typeof OS.saveProject==='function'){const save=OS.saveProject.bind(OS);OS.saveProject=async(...args)=>{await this.fireEvent('beforeSave',{});const result=await save(...args);await this.fireEvent('afterSave',{});return result;};}
+            if(typeof OS._handleFileLoad==='function'){const open=OS._handleFileLoad.bind(OS);OS._handleFileLoad=async(...args)=>{const result=await open(...args);await this.fireEvent('onOpen',{name:args[0]?.name||''});return result;};}
+
+            document.addEventListener('keydown',event=>{
+                if(event.repeat||event.target?.matches?.('input,textarea,select,[contenteditable="true"]'))return;
+                const command=this._loadHotkeys()[this._combo(event)];if(!command)return;event.preventDefault();
+                if(command==='recent')void ScriptEngine.runRecent();
+                else if(command==='library')ScriptEngine.showLibrary();
+                else if(command==='export')LayerExport.showDialog();
+                else if(command==='batch')this.showBatch();
+                else if(command==='skin')OS.setTool('skin-retouch');
+                else if(command==='help')this.showHelp();
+                else if(command.startsWith('script:')){const script=ScriptEngine.list().find(s=>s.id===command.slice(7));if(script)void ScriptEngine.run(script.source,{name:script.name});}
+            },true);
+        },
+        installMenus() {
+            const fileMenu=[...document.querySelectorAll('.menu-item')].find(n=>n.firstChild?.textContent?.trim()==='File'),drop=fileMenu?.querySelector(':scope > .menu-dropdown');
+            if(drop&&!drop.querySelector('[data-kp-batch]')){const batch=el('div',{class:'dd-item',text:'Batch Runner…',dataset:{kpBatch:'1'}});batch.addEventListener('click',()=>this.showBatch());const exportLayers=[...drop.children].find(n=>n.textContent?.trim()==='Export Layers…');exportLayers?.after(batch);}
+            const scripts=[...document.querySelectorAll('.dd-sub')].find(n=>n.firstChild?.textContent?.trim()==='Scripts'),sub=scripts?.querySelector(':scope > .menu-dropdown');
+            if(sub&&!sub.querySelector('[data-kp-templates]')){
+                const sep=el('div',{class:'dd-sep'}),templates=el('div',{class:'dd-item',text:'New From Template…',dataset:{kpTemplates:'1'}}),events=el('div',{class:'dd-item',text:'Script Events…'}),hotkeys=el('div',{class:'dd-item',text:'Assign Hotkeys…'});
+                templates.addEventListener('click',()=>this.showTemplates());events.addEventListener('click',()=>this.showEvents());hotkeys.addEventListener('click',()=>this.showHotkeys());sub.append(sep,templates,events,hotkeys);
+            }
+            const helpMenu=[...document.querySelectorAll('.menu-item')].find(n=>n.firstChild?.textContent?.trim()==='Help'),helpDrop=helpMenu?.querySelector(':scope > .menu-dropdown');
+            if(helpDrop&&!helpDrop.querySelector('[data-kp-guide]')){const guide=el('div',{class:'dd-item',text:'KanPaint Guide…',dataset:{kpGuide:'1'}});guide.addEventListener('click',()=>this.showHelp());helpDrop.prepend(guide);}
+        }
+    };
+    kp.automation=Automation;
+
+    function addFileMenu() {
+        const fileMenu=[...document.querySelectorAll('.menu-item')].find(node=>node.firstChild?.textContent?.trim()==='File'); const dropdown=fileMenu?.querySelector(':scope > .menu-dropdown'); if(!dropdown)return;
+        const exportAs=[...dropdown.children].find(node=>node.classList?.contains('dd-sub') && node.textContent.trim().startsWith('Export As'));
+        const exportLayers=el('div',{class:'dd-item',text:'Export Layers…'}); exportLayers.addEventListener('click',()=>LayerExport.showDialog()); exportAs?.after(exportLayers);
+        const scripts=el('div',{class:'dd-sub dd-item',text:'Scripts'}); const sub=el('div',{class:'menu-dropdown'}); const run=el('div',{class:'dd-item',text:'Run Script…'}); const recent=el('div',{class:'dd-item',text:'Run Last Script'}); const library=el('div',{class:'dd-item',text:'Script Library…'}); const note=el('div',{class:'dd-note',text:'Sandboxed · local library'}); run.addEventListener('click',()=>ScriptEngine.runFile()); recent.addEventListener('click',()=>void ScriptEngine.runRecent()); library.addEventListener('click',()=>ScriptEngine.showLibrary()); sub.append(run,recent,library,note); scripts.append(sub);
+        const projectSep=[...dropdown.children].find((node,index,arr)=>node.classList?.contains('dd-sep') && arr[index+1]?.textContent?.includes('Templates'));
+        if(projectSep) dropdown.insertBefore(scripts,projectSep); else dropdown.append(scripts);
+    }
+
+    function patchCoreForSkin() {
+        const originalSetTool=OS.setTool;
+        OS.setTool=function(tool){
+            if(tool!=='skin-retouch'){
+                if(this.state.tool==='skin-retouch' && Skin.session?.dirty){
+                    const apply = window.confirm('Skin Retouch has unapplied changes. Apply them before switching tools?');
+                    if(apply){
+                        void Skin.apply({silent:true}).then(()=>{
+                            document.getElementById('kp-skin-panel')?.classList.remove('visible');
+                            originalSetTool.call(OS,tool);
+                        });
+                        return true;
+                    }
+                    Skin.cancel({silent:true});
+                }
+                document.getElementById('kp-skin-panel')?.classList.remove('visible');
+                return originalSetTool.call(this,tool);
+            }
+            // Reuse Dodge's cursor / interaction setup, then replace the UI state.
+            const ok=originalSetTool.call(this,'dodge'); if(ok===false)return false; this.state.tool='skin-retouch';
+            document.querySelectorAll('.tool-btn').forEach(b=>{const active=b.dataset.tool==='skin-retouch';b.classList.toggle('active',active);b.setAttribute('aria-pressed',active?'true':'false');});
+            document.querySelectorAll('#tool-options .opt-group').forEach(g=>{g.style.display='none';}); const options=document.getElementById('opt-kp-skin');if(options)options.style.display='flex';
+            if(this.canvas){this.canvas.isDrawingMode=false;this.canvas.selection=false;this.canvas.defaultCursor='crosshair';this.canvas.hoverCursor='crosshair';this.canvas.forEachObject(o=>{o.selectable=false;o.evented=false;});}
+            const display=document.getElementById('tool-display');if(display)display.textContent='Skin Retouch';document.getElementById('kp-skin-panel')?.classList.add('visible');Skin._updatePanelState();const active=this.canvas?.getActiveObject?.();if(active?.[RETOUCH_PROP])void Skin.loadActiveRetouch(active,{silent:true});return true;
+        };
+        const down=OS.onMouseDown,move=OS.onMouseMove,up=OS.onMouseUp;
+        OS.onMouseDown=function(opt){if(this.state.tool==='skin-retouch')return Skin.onDown(opt);return down.call(this,opt);};
+        OS.onMouseMove=function(opt){if(this.state.tool==='skin-retouch'){const ptr=this.canvas.getScenePoint(opt.e);const pos=document.getElementById('cursor-pos');if(pos)pos.textContent=`X: ${Math.round(ptr.x)} Y: ${Math.round(ptr.y)}`;return Skin.onMove(opt);}return move.call(this,opt);};
+        OS.onMouseUp=function(opt){if(this.state.tool==='skin-retouch')return Skin.onUp(opt);return up.call(this,opt);};
+    }
+
+    function addCommandPaletteEntries() {
+        // _getCommands caches its array; append after init so existing command
+        // palette internals remain untouched.
+        const commands=OS._getCommands?.(); if(!Array.isArray(commands))return;
+        const add=(label,cat,fn)=>{if(!commands.some(c=>c.label===label))commands.push({label,cat,fn});};
+        add('Export Layers…','File',()=>LayerExport.showDialog()); add('Run Script…','File',()=>ScriptEngine.runFile()); add('Run Last Script','File',()=>void ScriptEngine.runRecent()); add('Script Library…','File',()=>ScriptEngine.showLibrary()); add('Tool: Skin Retouch','Tool',()=>OS.setTool('skin-retouch'));
+    }
+
+    function brandVisibleShell() {
+        const logo=document.querySelector('.logo'); if(logo){logo.setAttribute('aria-label','KanPaint version 0.1');const mark=logo.querySelector('.logo-mark');const word=logo.querySelector('.logo-word');const ver=logo.querySelector('.logo-version');if(mark)mark.textContent='KP';if(word)word.textContent='KanPaint';if(ver)ver.textContent='v0.1';}
+        document.title='KanPaint v0.1 | Browser Image Editor';
+    }
+
+    // Patch methods before OS.init binds them to Fabric events.
+    patchCoreForSkin();
+    Automation.install();
+    addFileMenu();
+    Automation.installMenus();
+    addSkinUI();
+    brandVisibleShell();
+    window.addEventListener('DOMContentLoaded',()=>setTimeout(()=>{addCommandPaletteEntries();Automation.installMenus();Skin._updatePanelState();},0));
+})();
