@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 
 const dir=path.resolve(process.argv[2]||'dist');
 const required=['index.html','kanpaint-v01.js','kanpaint-v01.css'];
@@ -9,6 +10,15 @@ for(const file of required){
   if(fs.statSync(full).size<100) throw new Error('Build asset is unexpectedly small: '+file);
 }
 const html=fs.readFileSync(path.join(dir,'index.html'),'utf8');
+const cspMatch=html.match(/<meta\s+http-equiv="Content-Security-Policy"\s+content="([^"]*)">/i);
+if(!cspMatch) throw new Error('Missing Content-Security-Policy meta tag');
+const cspHashes=new Set([...cspMatch[1].matchAll(/'sha256-([^']+)'/g)].map(match=>match[1]));
+const inlineScripts=[...html.matchAll(/<script(?![^>]*\bsrc\s*=)[^>]*>([\s\S]*?)<\/script>/gi)].map(match=>match[1]);
+if(!inlineScripts.length) throw new Error('No inline scripts found for CSP verification');
+for(const [index,script] of inlineScripts.entries()){
+  const hash=createHash('sha256').update(script).digest('base64');
+  if(!cspHashes.has(hash)) throw new Error(`CSP blocks inline script #${index+1}`);
+}
 const js=fs.readFileSync(path.join(dir,'kanpaint-v01.js'),'utf8');
 for(const token of ['KanPaint v0.1','kanpaint-v01.js','kanpaint-v01.css']){
   if(!html.includes(token)) throw new Error('index.html missing token: '+token);
