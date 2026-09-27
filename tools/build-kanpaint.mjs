@@ -110,7 +110,7 @@ html = mustReplace(
 );
 const KANPAINT_BOOT_TAGS = BOOT_VENDOR_ASSETS.map(asset =>
   `<script src="./vendor/boot/${asset.file}" integrity="${asset.integrity}" crossorigin="anonymous"></script>`
-).join('\\n');
+).join('\n');
 
 const KANPAINT_BOOT_RECOVERY = `<script>
 (() => {
@@ -157,8 +157,8 @@ const KANPAINT_BOOT_RECOVERY = `<script>
 
 html = mustReplace(
   html,
-  '</title>\\n<script>',
-  `</title>\\n<link rel="stylesheet" href="./kanpaint-v01.css">\\n${KANPAINT_BOOT_RECOVERY}\\n${KANPAINT_BOOT_TAGS}\\n<script>`,
+  '</title>\n<script>',
+  `</title>\n<link rel="stylesheet" href="./kanpaint-v01.css">\n${KANPAINT_BOOT_RECOVERY}\n${KANPAINT_BOOT_TAGS}\n<script>`,
   'KanPaint stylesheet + local boot + service-worker recovery'
 );
 html = mustReplace(html,
@@ -231,7 +231,8 @@ fs.writeFileSync(path.join(out, 'KANPAINT_BUILD.txt'), [
   'KanPaint v0.1.0',
   'Based on OpenShop 0.31.0',
   'KanPaint extensions: Export Layers + Auto Trim, sandboxed Scripts + Script Library, Skin Retouch.',
-  'Boot libraries: same-origin vendored Fabric.js, ag-psd and jsPDF loaded directly before editor startup.',\n  'Hotfix: legacy OpenShop service worker is disabled/unregistered so stale shell caches cannot block KanPaint boot.',
+  'Boot libraries: same-origin vendored Fabric.js, ag-psd and jsPDF loaded directly before editor startup.',
+  'Hotfix: legacy OpenShop service worker is disabled/unregistered so stale shell caches cannot block KanPaint boot.',
   'See repository NOTICE.md and upstream LICENSE.',
   '',
 ].join('\n'));
