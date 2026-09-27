@@ -35,5 +35,17 @@ for(const token of ['./vendor/boot/fabric-7.4.0.min.js','./vendor/boot/ag-psd-31
   if(!html.includes(token)) throw new Error('Built app missing local boot/branding token: '+token);
 }
 if(html.includes('https://cdn.jsdelivr.net/npm/fabric@7.4.0/dist/index.min.js')) throw new Error('Fabric boot still depends on remote CDN');
+for(const token of ['__KANPAINT_DISABLE_PWA__','kanpaint-sw-recovery-v01','./vendor/boot/fabric-7.4.0.min.js','./vendor/boot/ag-psd-31.0.2.min.js','./vendor/boot/jspdf-4.2.1.umd.min.js']){
+  if(!html.includes(token)) throw new Error('KanPaint reliable-boot patch missing token: '+token);
+}
+const sw=fs.readFileSync(path.join(dir,'sw.js'),'utf8');
+if(!sw.includes("const SHELL_REVISION = '0.1.0-r4';")) throw new Error('KanPaint service-worker revision was not bumped');
+for(const remote of [
+  'https://cdn.jsdelivr.net/npm/fabric@7.4.0/dist/index.min.js',
+  'https://cdn.jsdelivr.net/npm/ag-psd@31.0.2/dist/bundle.js',
+  'https://cdn.jsdelivr.net/npm/jspdf@4.2.1/dist/jspdf.umd.min.js'
+]){
+  if(sw.includes(remote)) throw new Error('Service worker still requires remote boot asset: '+remote);
+}
 const cssText=fs.readFileSync(path.join(dir,'kanpaint-v01.css'),'utf8');
 if(!cssText.includes('KanPaint dark application chrome')) throw new Error('Dark top chrome CSS missing');
