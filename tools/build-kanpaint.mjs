@@ -62,6 +62,11 @@ const vendorBootAssets = async () => {
 await vendorBootAssets();
 
 let html = read('index.html');
+const bootAwaitNeedle = '        await runVerifiedBootAssets();';
+const bootAwaitReplacement = '        if (!(globalThis.fabric && globalThis.agPsd && globalThis.jspdf)) await runVerifiedBootAssets();';
+const bootAwaitCount = html.split(bootAwaitNeedle).length - 1;
+if (bootAwaitCount < 2) throw new Error('Could not patch OpenShop verified boot fallback');
+html = html.split(bootAwaitNeedle).join(bootAwaitReplacement);
 html = mustReplace(html,
   '<meta name="description" content="OpenShop is a private browser image editor with layers, selections, PSD interchange, local export, and an installable offline shell.">',
   '<meta name="description" content="KanPaint is a browser image editor with layers, selections, PSD interchange, layer export, scripts, and skin retouch tools.">',
@@ -97,7 +102,65 @@ html = mustReplace(
   "ca.addEventListener('drop', e => { e.preventDefault(); document.getElementById('dropzone-overlay')?.classList.remove('visible'); e.stopPropagation(); void this.handleDrop(e); });",
   'drop overlay cleanup'
 );
-html = mustReplace(html, '</title>\n<script>', '</title>\n<link rel="stylesheet" href="./kanpaint-v01.css">\n<script>', 'extension stylesheet');
+html = mustReplace(
+  html,
+  "    async _registerHostedPWA() {\n        try {",
+  "    async _registerHostedPWA() {\n        if (globalThis.__KANPAINT_DISABLE_PWA__) {\n            this._setOfflineState({ shellReady:false, updateReady:false, error:null });\n            return false;\n        }\n        try {",
+  'disable hosted PWA for KanPaint hotfix'
+);
+const KANPAINT_BOOT_TAGS = BOOT_VENDOR_ASSETS.map(asset =>
+  `<script src="./vendor/boot/${asset.file}" integrity="${asset.integrity}" crossorigin="anonymous"></script>`
+).join('\\n');
+
+const KANPAINT_BOOT_RECOVERY = `<script>
+(() => {
+  globalThis.__KANPAINT_DISABLE_PWA__ = true;
+  const RECOVERY_KEY = 'kanpaint-sw-recovery-v01';
+  const resetLegacyOfflineShell = async () => {
+    if (!('serviceWorker' in navigator)) return false;
+    const registrations = await navigator.serviceWorker.getRegistrations();
+    const basePath = new URL('./', location.href).pathname;
+    const scoped = registrations.filter(registration => {
+      try { return new URL(registration.scope).pathname.startsWith(basePath); }
+      catch { return true; }
+    });
+    const hadController = Boolean(navigator.serviceWorker.controller);
+    await Promise.all(scoped.map(registration => registration.unregister()));
+    if ('caches' in globalThis) {
+      const keys = await caches.keys();
+      await Promise.all(keys.filter(key => key.startsWith('openshop-')).map(key => caches.delete(key)));
+    }
+    return hadController;
+  };
+
+  if (sessionStorage.getItem(RECOVERY_KEY) !== 'done') {
+    void resetLegacyOfflineShell().then(needsReload => {
+      if (!needsReload) return;
+      sessionStorage.setItem(RECOVERY_KEY, 'done');
+      location.reload();
+    }).catch(error => console.warn('KanPaint offline-shell recovery failed:', error));
+  }
+
+  addEventListener('DOMContentLoaded', () => {
+    const started = Date.now();
+    const timer = setInterval(() => {
+      if (document.documentElement.dataset.osBoot === 'ready') {
+        sessionStorage.removeItem(RECOVERY_KEY);
+        clearInterval(timer);
+      } else if (Date.now() - started > 15000) {
+        clearInterval(timer);
+      }
+    }, 500);
+  });
+})();
+</script>`;
+
+html = mustReplace(
+  html,
+  '</title>\\n<script>',
+  `</title>\\n<link rel="stylesheet" href="./kanpaint-v01.css">\\n${KANPAINT_BOOT_RECOVERY}\\n${KANPAINT_BOOT_TAGS}\\n<script>`,
+  'KanPaint stylesheet + local boot + service-worker recovery'
+);
 html = mustReplace(html,
 `    <div class="logo" aria-label="OpenShop version 0.31.0">
         <span class="logo-mark">OS</span>
@@ -149,10 +212,13 @@ if (fs.existsSync(runtimePath)) {
 const swPath = path.join(out, 'sw.js');
 if (fs.existsSync(swPath)) {
   let sw = fs.readFileSync(swPath, 'utf8');
-  sw = mustReplace(sw, "const SHELL_REVISION = '0.31.0-r1';", "const SHELL_REVISION = '0.1.0-r3';", 'service worker revision');
+  sw = mustReplace(sw, "const SHELL_REVISION = '0.31.0-r1';", "const SHELL_REVISION = '0.1.0-r4';", 'service worker revision');
+  for (const asset of BOOT_VENDOR_ASSETS) {
+    sw = sw.split(asset.url).join(`./vendor/boot/${asset.file}`);
+  }
   const revAnchor = "    SHELL_REVISION,\n";
   if (!sw.includes("    '0.31.0-r1',"))
-    sw = mustReplace(sw, revAnchor, `${revAnchor}    '0.31.0-r1',\n    '0.1.0-r1',\n`, 'rollback revision');
+    sw = mustReplace(sw, revAnchor, `${revAnchor}    '0.1.0-r3',\n    '0.1.0-r2',\n    '0.1.0-r1',\n    '0.31.0-r1',\n`, 'rollback revision');
   const assetAnchor = '    "./index.html",\n';
   if (!sw.includes('"./kanpaint-v01.js"'))
     sw = mustReplace(sw, assetAnchor, `${assetAnchor}    "./kanpaint-v01.js",\n    "./kanpaint-v01.css",\n`, 'service worker assets');
@@ -165,7 +231,7 @@ fs.writeFileSync(path.join(out, 'KANPAINT_BUILD.txt'), [
   'KanPaint v0.1.0',
   'Based on OpenShop 0.31.0',
   'KanPaint extensions: Export Layers + Auto Trim, sandboxed Scripts + Script Library, Skin Retouch.',
-  'Boot libraries: same-origin vendored Fabric.js, ag-psd and jsPDF for fast reliable startup.',
+  'Boot libraries: same-origin vendored Fabric.js, ag-psd and jsPDF loaded directly before editor startup.',\n  'Hotfix: legacy OpenShop service worker is disabled/unregistered so stale shell caches cannot block KanPaint boot.',
   'See repository NOTICE.md and upstream LICENSE.',
   '',
 ].join('\n'));
