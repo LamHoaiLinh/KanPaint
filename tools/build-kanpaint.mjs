@@ -26,6 +26,24 @@ const mustReplace = (value, search, replacement, label) => {
   return value.replace(search, replacement);
 };
 
+const refreshInlineScriptCsp = value => {
+  const inlineScripts = [...value.matchAll(/<script(?![^>]*\bsrc\s*=)[^>]*>([\s\S]*?)<\/script>/gi)]
+    .map(match => match[1]);
+  if (!inlineScripts.length) throw new Error('No inline scripts found while refreshing CSP');
+  const hashes = inlineScripts.map(script =>
+    `'sha256-${createHash('sha256').update(script).digest('base64')}'`
+  );
+  const metaPattern = /(<meta\s+http-equiv="Content-Security-Policy"\s+content=")([^"]*)(">)/i;
+  const match = value.match(metaPattern);
+  if (!match) throw new Error('Content-Security-Policy meta tag not found');
+  let policy = match[2];
+  policy = policy.replace(/script-src\s+([^;]*);/i, (full, sources) => {
+    const kept = sources.trim().split(/\s+/).filter(source => !/^'sha256-[^']+'$/.test(source));
+    return `script-src ${[...kept, ...hashes].join(' ')};`;
+  });
+  return value.replace(metaPattern, `${match[1]}${policy}${match[3]}`);
+};
+
 const BOOT_VENDOR_ASSETS = [
   {
     name:'Fabric.js',
@@ -174,6 +192,11 @@ html = mustReplace(html,
     </div>`,
   'logo');
 html = mustReplace(html, '</script>\n</body>\n</html>', '</script>\n<script src="./kanpaint-v01.js"></script>\n</body>\n</html>', 'extension script');
+// Every KanPaint build patches OpenShop's inline bootstrap/editor scripts and
+// adds one recovery script. Recalculate their CSP hashes after ALL HTML edits;
+// otherwise Chromium blocks the editor code and the welcome screen remains on
+// "Preparing the editing engine..." forever.
+html = refreshInlineScriptCsp(html);
 write('index.html', html);
 
 const srcDir = path.join(root, 'src');
